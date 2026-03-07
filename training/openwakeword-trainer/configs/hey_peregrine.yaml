@@ -1,0 +1,79 @@
+# openWakeWord Training Configuration — "hey peregrine"
+#
+# Usage:
+#   python train_wakeword.py --config configs/hey_peregrine.yaml
+
+# ── Model identity ──
+model_name: "hey_peregrine"
+
+# ── Target phrase(s) ──
+target_phrase:
+  - "hey peregrine"
+
+# ── Explicit negatives ──
+# Phrases the model should NOT trigger on.
+custom_negative_phrases:
+  - "hey pelican"
+  - "hey pergola"
+  - "hey paradigm"
+  - "hey penguin"
+  - "peregrine"
+  - "hey"
+  - "hey pilgrim"
+  - "hey predator"
+  - "hey parakeet"
+  - "hey perimeter"
+
+# ── Sample generation ──
+n_samples: 50000
+n_samples_val: 5000
+tts_batch_size: 25
+augmentation_batch_size: 16
+augmentation_rounds: 3
+
+# ── Paths (resolved by train_wakeword.py) ──
+piper_sample_generator_path: "data/piper-sample-generator"
+output_dir: "output"
+
+rir_paths:
+  - "data/mit_rirs"
+
+background_paths:
+  - "data/audioset_16k"
+  - "data/fma_small"
+
+background_paths_duplication_rate:
+  - 1
+  - 1
+
+# ── Pre-computed feature files ──
+false_positive_validation_data_path: "data/validation_set_features.npy"
+
+feature_data_files:
+  "negative_broad": "data/negative_features_librispeech_voxpopuli.npy"
+  "negative_ambient": "data/negative_features_ambient.npy"
+
+# ── Batch composition ──
+# negative_ambient gets its own dedicated slot so the model reliably sees
+# silence/noise examples every batch — not buried in the speech negatives.
+batch_n_per_class:
+  "negative_broad": 512
+  "negative_ambient": 100
+  "adversarial_negative": 50
+  "positive": 150
+
+# ── Model architecture ──
+model_type: "dnn"
+layer_size: 128
+
+# ── Training parameters ──
+steps: 200000
+max_negative_weight: 1000
+target_false_positives_per_hour: 0.5
+
+# ── Real recorded clips (mixed into synthetic data before augmentation) ──
+# These are copied into the TTS-generated clip directories so they get
+# augmented and featurized alongside the synthetic clips.
+real_positive_clips_dir: "../../real_clips/hey_peregrine"
+real_negative_clips_dirs:
+  - "../../real_clips_negative"

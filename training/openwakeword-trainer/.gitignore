@@ -1,0 +1,33 @@
+# ── Training artifacts (generated, large) ──
+output/
+data/
+export/
+
+# ── Virtual environments ──
+.venv*/
+*-venv*/
+*_venv*/
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ── IDE ──
+.vscode/
+.idea/
+*.code-workspace
+
+# ── Temporary files ──
+*.part
+*.tmp
+_run_*.sh

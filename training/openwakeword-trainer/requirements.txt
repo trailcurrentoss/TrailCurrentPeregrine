@@ -1,0 +1,40 @@
+# Training-only dependencies for openWakeWord custom model training.
+# Install inside WSL2 / Linux:
+#   pip install -r requirements.txt
+
+# --- Core training ---
+openwakeword
+torch>=2.0
+torchaudio>=2.0
+torchinfo>=1.8
+torchmetrics>=1.2
+speechbrain>=0.5.14
+
+# --- Audio augmentation ---
+audiomentations>=0.33
+torch-audiomentations>=0.11
+acoustics>=0.2.6
+
+# --- TTS & phonemics ---
+piper-phonemize-fix>=1.2.0
+pronouncing>=0.2.0
+deep-phonemizer>=0.0.19
+
+# --- Data & utilities ---
+datasets>=2.14
+mutagen>=1.47
+webrtcvad>=2.0.10
+scipy
+numpy
+pyyaml
+tqdm
+requests
+
+# --- Compat patches ---
+# setuptools<82 keeps pkg_resources (removed in 82+)
+# soundfile is the fallback backend for patched torchaudio 2.10+
+setuptools<82
+soundfile
+onnxruntime          # for verify-model step
+onnx                 # for ONNX export from PyTorch
+onnxscript           # required by torch.onnx.export in PyTorch 2.x

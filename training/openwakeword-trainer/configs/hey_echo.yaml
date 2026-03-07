@@ -1,0 +1,73 @@
+# openWakeWord Training Configuration
+#
+# This is an example config for training a "hey echo" wake word model.
+# Copy this file and modify it to train your own custom wake word.
+#
+# Usage:
+#   python train_wakeword.py --config configs/hey_echo.yaml
+#
+# All paths are relative to the project root and will be resolved
+# to absolute paths by the training script.
+
+# ── Model identity ──
+model_name: "hey_echo"
+
+# ── Target phrase(s) ──
+# The model activates on ANY of these phrases.
+target_phrase:
+  - "hey echo"
+
+# ── Explicit negatives ──
+# Phrases the model should NOT trigger on. The pipeline also auto-generates
+# adversarial negatives via CMU phoneme substitution.
+custom_negative_phrases:
+  - "hey gecko"
+  - "hey deco"
+  - "hey seco"
+  - "echo"
+  - "hey"
+  - "hey techno"
+  - "hey jericho"
+
+# ── Sample generation ──
+n_samples: 50000           # positive training clips
+n_samples_val: 5000        # positive validation clips
+tts_batch_size: 25         # Piper TTS batch size (reduce for low VRAM GPUs)
+augmentation_batch_size: 16
+augmentation_rounds: 1     # >1 reuses clips with different augmentation
+
+# ── Paths (resolved by train_wakeword.py) ──
+piper_sample_generator_path: "data/piper-sample-generator"
+output_dir: "output"
+
+rir_paths:
+  - "data/mit_rirs"
+
+background_paths:
+  - "data/audioset_16k"
+  - "data/fma_small"
+
+background_paths_duplication_rate:
+  - 1
+  - 1
+
+# ── Pre-computed feature files ──
+false_positive_validation_data_path: "data/validation_set_features.npy"
+
+feature_data_files:
+  "negative_broad": "data/negative_features_librispeech_voxpopuli.npy"
+
+# ── Batch composition ──
+batch_n_per_class:
+  "negative_broad": 1024
+  "adversarial_negative": 50
+  "positive": 50
+
+# ── Model architecture ──
+model_type: "dnn"     # "dnn" or "rnn"
+layer_size: 32        # 32 = fast CPU inference; 64/128 for higher capacity
+
+# ── Training parameters ──
+steps: 50000
+max_negative_weight: 1500
+target_false_positives_per_hour: 0.2
