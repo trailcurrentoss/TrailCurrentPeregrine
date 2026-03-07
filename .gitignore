@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+venv/
+.venv/
+assistant-env/
+
+# Models (large binaries — download at deploy time)
+*.onnx
+*.onnx.json
+*.bin
+*.pt
+*.safetensors
+
+# Audio artifacts
+*.wav
+*.flac
+*.mp3
+*.raw
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# AI agent configuration (local only — never commit)
+.claude
+.claude/
+.claude.md
+CLAUDE.md
+CLAUDE.MD
+.cursorrules
+.cursor/
+.github/copilot*
+.aider*
+.continue/
+.codeium/
+.tabnine*
+.sourcery.yaml
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Training caches (downloaded datasets — large, reproducible)
+training/.mssnsd_cache/
+training/.musan_cache/
+
+# Voice clips (personal recordings — not for public repos)
+training/real_clips/
+training/real_clips_negative/
+
+# Stray audio/recording files in repo root
+long_recording*
+karen_*

@@ -1,0 +1,3 @@
+[submodule "training/openwakeword-trainer"]
+	path = training/openwakeword-trainer
+	url = https://github.com/lgpearson1771/openwakeword-trainer.git

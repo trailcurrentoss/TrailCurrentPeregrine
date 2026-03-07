@@ -1,0 +1,34 @@
+[Unit]
+Description=Local Voice Assistant
+After=network.target sound.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=assistant
+Group=audio
+WorkingDirectory=/home/assistant
+ExecStartPre=/bin/sleep 5
+ExecStart=/home/assistant/assistant-env/bin/python3 /home/assistant/assistant.py
+Restart=on-failure
+RestartSec=10
+
+# Environment
+Environment=HOME=/home/assistant
+# Wake word — custom "hey peregrine" model
+Environment=WAKE_MODEL_PATH=/home/assistant/models/hey_peregrine.onnx
+Environment=PATH=/home/assistant/assistant-env/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+# Site-specific config (MQTT, thresholds, etc.) lives in this file on the board.
+# It is never overwritten by deploys. Edit it with: nano ~/assistant.env
+EnvironmentFile=-/home/assistant/assistant.env
+
+# Hardening
+ProtectSystem=strict
+ReadWritePaths=/home/assistant /tmp
+ProtectHome=tmpfs
+BindPaths=/home/assistant
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
