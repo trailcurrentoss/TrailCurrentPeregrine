@@ -72,6 +72,7 @@ apt install -y \
     alsa-utils \
     libsndfile1 \
     libasound2-dev \
+    avahi-daemon \
     htop \
 || step_fail "Some packages failed to install"
 
