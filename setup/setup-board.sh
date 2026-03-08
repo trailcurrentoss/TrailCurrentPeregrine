@@ -9,17 +9,37 @@
 # Idempotent — safe to re-run on a fresh board or an existing one.
 # Each step checks whether work is already done and skips if so.
 #
-# Fresh board:
-#   chmod +x setup-board.sh && sudo ./setup-board.sh
+# Modes:
+#   debug (default) — WiFi and HDMI/TTY console stay enabled for access
+#   prod            — full hardening: WiFi and HDMI disabled for power savings
 #
-# Existing board (e.g., after OS update or to apply new hardening):
-#   sudo ./setup-board.sh
+# Usage:
+#   chmod +x setup-board.sh && sudo ./setup-board.sh              # debug mode
+#   sudo ./setup-board.sh --mode prod                             # production
 #
 # After setup, deploy application code from your dev machine:
 #   ./deploy.sh assistant@<board-ip>
 # ============================================================================
 
 set -uo pipefail
+
+# --- Mode selection ---------------------------------------------------------
+SETUP_MODE="debug"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mode)
+            shift
+            case "${1:-}" in
+                debug|prod) SETUP_MODE="$1" ;;
+                *) echo "Unknown mode '${1:-}'. Use 'debug' or 'prod'."; exit 1 ;;
+            esac
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1"; exit 1 ;;
+    esac
+done
 
 ASSISTANT_USER="assistant"
 ASSISTANT_HOME="/home/${ASSISTANT_USER}"
@@ -32,6 +52,7 @@ PIPER_DIR="${ASSISTANT_HOME}/piper-voices"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 log()  { echo -e "${GREEN}[+]${NC} $*"; }
@@ -49,6 +70,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo ""
 echo "============================================"
 echo "  Voice Assistant — Board Setup & Hardening"
+echo -e "  Mode: ${CYAN}${SETUP_MODE}${NC}"
 echo "============================================"
 echo ""
 
@@ -58,7 +80,7 @@ echo ""
 log "1. System packages"
 
 apt update -y || step_fail "apt update failed"
-apt upgrade -y || warn "apt upgrade had issues (continuing)"
+apt upgrade -y --allow-downgrades || warn "apt upgrade had issues (continuing)"
 
 apt install -y \
     python3 \
@@ -309,6 +331,27 @@ for dm in gdm3 gdm lightdm sddm; do
 done
 
 # ============================================================================
+# 9b. Ensure TTY console on HDMI and serial (debug mode only)
+# ============================================================================
+if [[ "${SETUP_MODE}" == "debug" ]]; then
+    log "9b. Ensure TTY console on HDMI/serial"
+
+    systemctl enable getty@tty1.service 2>/dev/null || true
+    systemctl start getty@tty1.service 2>/dev/null || true
+    log "  Enabled getty on tty1 (HDMI console)"
+
+    for serial_tty in ttyS2 ttyFIQ0; do
+        if [[ -e "/dev/${serial_tty}" ]]; then
+            systemctl enable "serial-getty@${serial_tty}.service" 2>/dev/null || true
+            systemctl start "serial-getty@${serial_tty}.service" 2>/dev/null || true
+            log "  Enabled serial console on ${serial_tty}"
+        fi
+    done
+else
+    log "9b. TTY console setup skipped (prod mode)"
+fi
+
+# ============================================================================
 # 10. Disable unnecessary services
 # ============================================================================
 log "10. Disable unnecessary services"
@@ -321,7 +364,6 @@ DISABLE_SERVICES=(
     udisks2
     cups cups-browsed
     ModemManager
-    wpa_supplicant
     bluetooth
     snapd snapd.socket snapd.seeded
     fwupd
@@ -334,6 +376,10 @@ DISABLE_SERVICES=(
     e2scrub_all.timer
     fstrim.timer
 )
+
+if [[ "${SETUP_MODE}" == "prod" ]]; then
+    DISABLE_SERVICES+=( wpa_supplicant )
+fi
 
 for svc in "${DISABLE_SERVICES[@]}"; do
     if systemctl is-enabled "$svc" 2>/dev/null | grep -qE "enabled|static"; then
@@ -530,9 +576,14 @@ _unbind_driver rkvdec2     "video decoder"
 _unbind_driver rkvenc      "video encoder"
 _unbind_driver hantro-vpu  "video codec"
 _unbind_driver rkisp       "camera ISP"
-_unbind_driver dw-hdmi-qp-rockchip "HDMI"
-_unbind_driver dwhdmi-rockchip     "HDMI"
-_unbind_driver rockchip-vop2       "display controller"
+
+if [[ "${SETUP_MODE}" == "prod" ]]; then
+    _unbind_driver dw-hdmi-qp-rockchip "HDMI"
+    _unbind_driver dwhdmi-rockchip     "HDMI"
+    _unbind_driver rockchip-vop2       "display controller"
+else
+    log "  HDMI/display kept active (debug mode)"
+fi
 
 # WiFi power save
 iw dev 2>/dev/null | grep Interface | awk '{print $2}' | while read -r iface; do
@@ -541,7 +592,13 @@ iw dev 2>/dev/null | grep Interface | awk '{print $2}' | while read -r iface; do
 done
 
 # Persist hardware power-down across reboots
-cat > /etc/systemd/system/power-save-hw.service << 'PWREOF'
+if [[ "${SETUP_MODE}" == "prod" ]]; then
+    POWERSAVE_DRIVERS="panfrost panthor rknpu rkvdec2 rkvenc hantro-vpu rkisp dw-hdmi-qp-rockchip dwhdmi-rockchip rockchip-vop2"
+else
+    POWERSAVE_DRIVERS="panfrost panthor rknpu rkvdec2 rkvenc hantro-vpu rkisp"
+fi
+
+cat > /etc/systemd/system/power-save-hw.service << PWREOF
 [Unit]
 Description=Disable unused RK3588S hardware for power savings
 After=multi-user.target
@@ -550,23 +607,22 @@ After=multi-user.target
 Type=oneshot
 ExecStart=/bin/bash -c '\
   for gpu in /sys/class/devfreq/*gpu*; do \
-    [ -f "$gpu/governor" ] && echo powersave > "$gpu/governor"; \
-    min=$(awk "{print \\$1}" "$gpu/available_frequencies" 2>/dev/null); \
-    [ -n "$min" ] && echo "$min" > "$gpu/max_freq" && echo "$min" > "$gpu/min_freq"; \
+    [ -f "\$gpu/governor" ] && echo powersave > "\$gpu/governor"; \
+    min=\$(awk "{print \\\\\$1}" "\$gpu/available_frequencies" 2>/dev/null); \
+    [ -n "\$min" ] && echo "\$min" > "\$gpu/max_freq" && echo "\$min" > "\$gpu/min_freq"; \
   done; \
-  for drv in panfrost panthor rknpu rkvdec2 rkvenc hantro-vpu rkisp \
-             dw-hdmi-qp-rockchip dwhdmi-rockchip rockchip-vop2; do \
-    d="/sys/bus/platform/drivers/$drv"; [ -d "$d" ] && \
-    for dev in "$d"/*/; do n=$(basename "$dev"); \
-      [ "$n" != module ] && [ "$n" != uevent ] && echo "$n" > "$d/unbind" 2>/dev/null; \
+  for drv in ${POWERSAVE_DRIVERS}; do \
+    d="/sys/bus/platform/drivers/\$drv"; [ -d "\$d" ] && \
+    for dev in "\$d"/*/; do n=\$(basename "\$dev"); \
+      [ "\$n" != module ] && [ "\$n" != uevent ] && echo "\$n" > "\$d/unbind" 2>/dev/null; \
     done; \
   done; \
   for dev in /sys/bus/usb/devices/*/power/control; do \
-    dp=$(dirname "$dev"); audio=false; \
-    for ifc in "$dp"/*:*/bInterfaceClass; do \
-      [ -f "$ifc" ] && grep -q 01 "$ifc" 2>/dev/null && audio=true && break; \
+    dp=\$(dirname "\$dev"); audio=false; \
+    for ifc in "\$dp"/*:*/bInterfaceClass; do \
+      [ -f "\$ifc" ] && grep -q 01 "\$ifc" 2>/dev/null && audio=true && break; \
     done; \
-    $audio && echo on > "$dev" 2>/dev/null || echo auto > "$dev" 2>/dev/null; \
+    \$audio && echo on > "\$dev" 2>/dev/null || echo auto > "\$dev" 2>/dev/null; \
   done; \
   true'
 RemainAfterExit=yes
@@ -586,12 +642,26 @@ echo ""
 if [[ ${ERRORS} -eq 0 ]]; then
     log "============================================"
     log "  Setup complete! All steps passed."
+    echo -e "  ${CYAN}Mode: ${SETUP_MODE}${NC}"
     log "============================================"
 else
     warn "============================================"
     warn "  Setup finished with ${ERRORS} error(s)."
+    echo -e "  ${CYAN}Mode: ${SETUP_MODE}${NC}"
     warn "  Review output above, fix issues, re-run."
     warn "============================================"
+fi
+
+if [[ "${SETUP_MODE}" == "debug" ]]; then
+    echo ""
+    echo "  WiFi and HDMI/TTY console are ENABLED (debug mode)."
+    echo "  For production hardening, re-run with:"
+    echo "     sudo ./setup-board.sh --mode prod"
+else
+    echo ""
+    echo "  WiFi and HDMI are DISABLED (prod mode)."
+    echo "  To restore access for debugging, re-run with:"
+    echo "     sudo ./setup-board.sh --mode debug"
 fi
 
 echo ""
