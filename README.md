@@ -2,6 +2,10 @@
 
 Local voice assistant for the TrailCurrent platform, running on a Radxa Dragon Q6A (Qualcomm QCS6490, 8 GB RAM, Armbian Noble 24.04).
 
+<p align="center">
+  <img src="CAD/peregrine_case.png" alt="TrailCurrentPeregrine case" width="480">
+</p>
+
 ## Architecture
 
 The assistant runs an entirely offline voice pipeline:
