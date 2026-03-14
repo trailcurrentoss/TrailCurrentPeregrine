@@ -649,18 +649,6 @@ def _build_can_message(can_id, data_bytes):
     }
 
 
-def _update_device_state(device_id, **kwargs):
-    """Optimistically update cached device state after sending a command.
-
-    This bridges the gap between sending a command and receiving the MQTT
-    status update back from the device.  Incoming MQTT messages will
-    overwrite these values when the real status arrives.
-    """
-    topic = f"local/lights/{device_id}/status"
-    if topic not in sensor_data:
-        sensor_data[topic] = {}
-    sensor_data[topic].update(kwargs)
-
 
 def _execute_light_command(light_id, state):
     """Send a light command via MQTT. Returns spoken confirmation.
@@ -677,47 +665,26 @@ def _execute_light_command(light_id, state):
         light_ids = [did for did, dtype in _device_types_by_id.items() if dtype == "light"]
         if not light_ids:
             return "I don't know which lights are available yet."
-        sent = 0
         for lid in sorted(light_ids):
             relay_ch = _relay_channel_by_id.get(lid)
             if relay_ch is not None:
                 # Switchback relay typed as "light" — use relay topic
-                status = sensor_data.get(f"local/relays/{relay_ch}/status", {})
-                current = status.get("state")
-                if current is not None and current == state:
-                    name = _device_names_by_id.get(lid, f"light {lid}")
-                    print(f"  Skipping {name} (already {state_word})")
-                    continue
-                name = _device_names_by_id.get(lid, f"relay {relay_ch}")
                 topic = f"local/relays/{relay_ch}/command"
                 payload = json.dumps({"state": state})
                 mqtt.publish(topic, payload)
-                if f"local/relays/{relay_ch}/status" not in sensor_data:
-                    sensor_data[f"local/relays/{relay_ch}/status"] = {}
-                sensor_data[f"local/relays/{relay_ch}/status"]["state"] = state
                 print(f"  MQTT publish: {topic} -> {payload}")
             else:
                 # PDM light — use lights topic
-                status = sensor_data.get(f"local/lights/{lid}/status", {})
-                current = status.get("state")
-                if current is not None and current == state:
-                    name = _device_names_by_id.get(lid, f"light {lid}")
-                    print(f"  Skipping {name} (already {state_word})")
-                    continue
                 topic = f"local/lights/{lid}/command"
                 payload = json.dumps({"state": state})
                 mqtt.publish(topic, payload)
-                _update_device_state(lid, state=state)
                 print(f"  MQTT publish: {topic} -> {payload}")
-            sent += 1
-        if sent == 0:
-            return f"All lights are already {state_word}."
         return f"Turning {state_word} all lights."
     else:
         topic = f"local/lights/{light_id}/command"
         payload = json.dumps({"state": state})
         mqtt.publish(topic, payload)
-        _update_device_state(int(light_id), state=state)
+
         print(f"  MQTT publish: {topic} -> {payload}")
         name = _device_names_by_id.get(int(light_id), f"light {light_id}")
         return f"Turning {state_word} {name}."
@@ -741,13 +708,12 @@ def _execute_brightness_command(light_id, percent):
         for lid in sorted(light_ids):
             topic = f"local/lights/{lid}/brightness"
             mqtt.publish(topic, payload)
-            _update_device_state(lid, brightness=brightness)
+
             print(f"  MQTT publish: {topic} -> {payload} ({percent}%)")
         return f"Setting all lights to {percent} percent."
 
     topic = f"local/lights/{light_id}/brightness"
     mqtt.publish(topic, payload)
-    _update_device_state(int(light_id), brightness=brightness)
     print(f"  MQTT publish: {topic} -> {payload} ({percent}%)")
     name = _device_names_by_id.get(int(light_id), f"light {light_id}")
     return f"Setting {name} to {percent} percent."
@@ -770,7 +736,6 @@ def _execute_device_command(device_id, device_name, device_type, state):
     topic = f"local/lights/{device_id}/command"
     payload = json.dumps({"state": state})
     mqtt.publish(topic, payload)
-    _update_device_state(device_id, state=state)
     print(f"  MQTT publish: {topic} -> {payload}")
     return f"Turning {state_word} the {device_name}."
 
@@ -791,20 +756,9 @@ def _execute_relay_command(device_id, device_name, state, relay_channel=None):
     if relay_channel is None:
         return f"Sorry, I don't know the relay channel for {device_name}."
 
-    # Check current state — individual relay commands are toggles on CAN,
-    # so skip if already in the desired state to avoid toggling back
-    status_topic = f"local/relays/{relay_channel}/status"
-    current = sensor_data.get(status_topic, {}).get("state")
-    if current is not None and current == state:
-        return f"The {device_name} is already {state_word}."
-
     topic = f"local/relays/{relay_channel}/command"
     payload = json.dumps({"state": state})
     mqtt.publish(topic, payload)
-    # Optimistic state update on the relay status topic
-    if status_topic not in sensor_data:
-        sensor_data[status_topic] = {}
-    sensor_data[status_topic]["state"] = state
     print(f"  MQTT publish: {topic} -> {payload}")
     return f"Turning {state_word} the {device_name}."
 
@@ -821,12 +775,6 @@ def _execute_relay_all_command(state):
     topic = "local/relays/all/command"
     payload = json.dumps({"state": state})
     mqtt.publish(topic, payload)
-    # Optimistic state update for all relay channels
-    for dev_id, relay_ch in _relay_channel_by_id.items():
-        status_topic = f"local/relays/{relay_ch}/status"
-        if status_topic not in sensor_data:
-            sensor_data[status_topic] = {}
-        sensor_data[status_topic]["state"] = state
     print(f"  MQTT publish: {topic} -> {payload}")
     return f"Turning {state_word} all relays."
 
