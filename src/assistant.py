@@ -497,6 +497,7 @@ def _connect_mqtt():
             client.subscribe("local/lights/+/status")
             client.subscribe("local/relays/+/status")
             client.subscribe("local/thermostat/status")
+            client.subscribe("local/level/tilt")
             client.subscribe("local/config/pdm_channels")
             client.subscribe("local/config/relay_channels")
             _mqtt_connected.set()
@@ -640,6 +641,18 @@ def get_sensor_summary():
         gnss_mode = gps_details.get("gnssMode")
         if gnss_mode is not None:
             lines.append(f"GNSS mode: {gnss_mode}")
+
+    tilt = sensor_data.get("local/level/tilt")
+    if tilt:
+        fb = tilt.get("front_back")
+        ss = tilt.get("side_to_side")
+        if fb is not None and ss is not None:
+            fb_mm = tilt.get("front_back_diff_mm", 0)
+            lr_mm = tilt.get("left_right_diff_mm", 0)
+            fb_in = fb_mm / 25.4
+            lr_in = lr_mm / 25.4
+            lines.append(f"Tilt front-to-back: {fb:.1f}° ({abs(fb_in):.1f} inches {'low in front' if fb_in < 0 else 'low in back' if fb_in > 0 else 'level'})")
+            lines.append(f"Tilt side-to-side: {ss:.1f}° ({abs(lr_in):.1f} inches {'low on left' if lr_in < 0 else 'low on right' if lr_in > 0 else 'level'})")
 
     if not lines:
         return "No sensor data available yet."
@@ -1342,6 +1355,12 @@ _SATELLITE_PATTERNS = [
     re.compile(r"\bhow\s+many\s+sat", re.I),
     re.compile(r"\bgps\s+(?:signal|fix|status|lock)\b", re.I),
 ]
+_LEVEL_PATTERNS = [
+    re.compile(r"\blevel\b", re.I),
+    re.compile(r"\btilt(?:ed|ing)?\b", re.I),
+    re.compile(r"\b(?:lean|leaning|crooked|straight|plumb)\b", re.I),
+    re.compile(r"\bpitch\b.*\broll\b", re.I),
+]
 
 
 def _get_light_status_response(light_id=None):
@@ -1487,6 +1506,31 @@ def match_intent(text):
     if text != original:
         print(f"  STT normalized: \"{original}\" -> \"{text}\"")
     is_question = bool(_IS_QUESTION.search(text))
+
+    # --- Level/tilt query (check before device resolution so "is the trailer level"
+    #     doesn't get captured as a device status query for a device named "trailer") ---
+    for pattern in _LEVEL_PATTERNS:
+        if pattern.search(text):
+            print("  Intent: level/tilt query")
+            tilt = sensor_data.get("local/level/tilt")
+            if tilt and tilt.get("front_back") is not None:
+                fb = tilt["front_back"]
+                ss = tilt.get("side_to_side", 0)
+                fb_mm = tilt.get("front_back_diff_mm", 0)
+                lr_mm = tilt.get("left_right_diff_mm", 0)
+                fb_in = abs(fb_mm / 25.4)
+                lr_in = abs(lr_mm / 25.4)
+                if abs(fb) < 0.5 and abs(ss) < 0.5:
+                    return "The trailer is level."
+                parts = []
+                if abs(fb) >= 0.5:
+                    direction = "low in front" if fb_mm < 0 else "low in back"
+                    parts.append(f"{abs(fb):.1f} degrees {direction}, about {fb_in:.1f} inches")
+                if abs(ss) >= 0.5:
+                    direction = "low on the left" if lr_mm < 0 else "low on the right"
+                    parts.append(f"{abs(ss):.1f} degrees {direction}, about {lr_in:.1f} inches")
+                return "The trailer is not level. It's " + ", and ".join(parts) + "."
+            return "I don't have level sensor data right now."
 
     # --- Named device resolution (dynamic from MQTT config) ---
     device = _resolve_device(text)
