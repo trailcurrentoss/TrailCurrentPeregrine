@@ -1,171 +1,132 @@
-# TrailCurrentPeregrine
+# TrailCurrent Peregrine
 
-Local voice assistant for the TrailCurrent platform, running on a Radxa Dragon Q6A (Qualcomm QCS6490, 8 GB RAM, Radxa OS Noble 24.04).
+Local voice assistant for the TrailCurrent platform, running on a Radxa
+Dragon Q6A (Qualcomm QCS6490, 8 GB RAM). Built as a flashable Ubuntu
+Noble 24.04 image — fresh board to working assistant in ~85 minutes.
 
 <p align="center">
-  <img src="CAD/peregrine_case.png" alt="TrailCurrentPeregrine case" width="480">
+  <img src="CAD/peregrine_case.png" alt="TrailCurrent Peregrine case" width="480">
 </p>
 
 ## Architecture
 
-The assistant runs an entirely offline voice pipeline:
+Entirely offline voice pipeline:
 
 1. **Wake word** — openWakeWord (custom `hey_peregrine` model)
 2. **Speech-to-text** — faster-whisper (`base.en`, INT8 on CPU)
-3. **LLM** — Llama 3.2 1B on Hexagon NPU via genie-t2t-run (~12 tok/s)
+3. **LLM** — Llama 3.2 1B on Hexagon NPU via `genie-t2t-run` (~12 tok/s)
 4. **Text-to-speech** — Piper TTS (`en_US-libritts_r-medium`)
 5. **Device control** — MQTT integration with TrailCurrent (lights, relays, sensors)
 
-All processing happens on-device. No cloud services required.
+All processing happens on-device. No cloud services required for the core loop.
 
-## Project Structure
+## Quick start — fresh board to working assistant
+
+```bash
+# 1. Build host setup (one time)
+sudo apt install -y jsonnet bdebstrap libguestfs-tools \
+    qemu-user-static binfmt-support device-tree-compiler \
+    gdisk parted git curl gpg pipx rsync unzip
+./image_build/preflight.sh --download-cache
+
+# 2. Build the image (~30-50 min)
+sudo ./image_build/build.sh
+
+# 3. Put board in EDL mode and flash
+sudo ./image_build/flash.sh --firmware     # one-time per board
+sudo ./image_build/flash.sh --os image_build/output/peregrine-q6a-v1.0.img
+
+# 4. Boot the board (Ethernet + 12V), wait ~3 minutes
+ssh trailcurrent@peregrine.local           # password: trailcurrent
+# First-login wizard runs automatically and forces a password change.
+
+# 5. Say "hey peregrine"
+```
+
+Full walkthrough → [image_build/README.md](image_build/README.md) and the seven docs in [image_build/docs/](image_build/docs/).
+
+## Project structure
 
 ```
 TrailCurrentPeregrine/
+├── README.md                       This file
+├── CLAUDE.md                       Project instructions
+├── LICENSE
+│
 ├── src/
-│   ├── assistant.py                  # Main voice assistant loop
-│   └── genie_server.py              # NPU LLM HTTP server (Genie /api/generate)
+│   ├── assistant.py                Main voice assistant loop
+│   └── genie_server.py             NPU LLM HTTP server
+│
 ├── config/
-│   ├── voice-assistant.service       # systemd unit file
-│   ├── genie-server.service          # NPU LLM server systemd unit
-│   └── pulse-default.pa              # PulseAudio config (disabled by setup)
-├── setup/
-│   └── setup-board.sh                # Board provisioning & hardening (idempotent)
-├── deploy.sh                         # Deploy code & models to board via SSH
+│   ├── voice-assistant.service     systemd unit (canonical, baked into image)
+│   └── genie-server.service        systemd unit (canonical, baked into image)
+│
 ├── models/
-│   ├── hey_peregrine.onnx            # Custom wake word model (graph)
-│   └── hey_peregrine.onnx.data       # Custom wake word model (weights)
+│   ├── hey_peregrine.onnx          Custom wake word model
+│   └── hey_peregrine.onnx.data
+│
 ├── docs/
-│   └── future-vision-modes.md        # Vision, safety chain, operating modes roadmap
-├── training/
-│   ├── record_wake_word.py           # Record positive & negative clips for training
-│   ├── generate_tts_variants.py      # Generate voice-cloned TTS training clips
-│   ├── generate_negative_clips.py    # Generate negative phrase TTS clips
-│   ├── record_ambient_negatives.py  # Record real ambient noise from a mic (30 min default)
-│   ├── generate_ambient_negatives.py # Generate/download ambient noise negatives
-│   ├── build_ambient_features.py     # Featurize ambient clips to .npy for training
-│   ├── real_clips/                   # Recorded wake word samples (positive)
-│   ├── real_clips_negative/          # Recorded negative samples (similar phrases, ambient)
-│   └── openwakeword-trainer/         # Wake word training pipeline (13-step)
-│       ├── train_wakeword.py         # Training orchestrator
-│       ├── configs/
-│       │   └── hey_peregrine.yaml    # Active training config
-│       └── docs/
-│           └── training_notes.md     # Technical notes & troubleshooting
-└── README.md
+│   └── future-vision-modes.md      Vision modes roadmap
+│
+├── deploy.sh                       Dev tool — push src/ to a running board
+│
+├── image_build/                    ★ Image build pipeline ★
+│   ├── README.md                   Quick start
+│   ├── docs/                       7 detailed walkthroughs
+│   ├── build.sh                    Top-level build orchestrator
+│   ├── preflight.sh                Build host setup verification
+│   ├── flash.sh                    edl-ng wrapper for SPI NOR + NVMe flashing
+│   ├── rsdk/                       Vendored Radxa SDK with Peregrine hooks
+│   ├── firmware/                   SPI NOR firmware (committed)
+│   ├── files/                      Static files baked into the image
+│   ├── cache/                      NPU model + Piper voice (gitignored)
+│   └── output/                     Built images (gitignored)
+│
+├── training/                       Wake-word training pipeline (large, mostly gitignored)
+│   ├── *.py                        Recording / generation scripts
+│   ├── recordings/                 Stray clips (gitignored)
+│   └── openwakeword-trainer/       Training pipeline + configs
+│
+├── CAD/                            Enclosure
+└── EDA/                            HAT PCB
 ```
 
-## Getting Started
+## Two install paths
 
-### Fresh Board Setup
+| Path | When | Time |
+|---|---|---|
+| **Image build + flash** ([image_build/](image_build/)) | New board, OS package change, model update, dependency change | ~50 min build + ~10 min flash |
+| **`deploy.sh`** | Iterating on `src/` on an already-flashed board | ~5 sec |
 
-Copy the repo to the Radxa board and run the setup script (as root):
+The image build is the **canonical install path**. `deploy.sh` is a development
+tool — its changes are lost on the next reflash. See
+[image_build/docs/07-development.md](image_build/docs/07-development.md).
 
-```bash
-cd setup/
-chmod +x setup-board.sh
-./setup-board.sh
-```
-
-This performs a complete provisioning:
-- Installs system packages (Python, ffmpeg, ALSA, etc.)
-- Installs NPU packages (fastrpc, libcdsprpc for Hexagon DSP access)
-- Creates the `assistant` user (added to `audio` and `render` groups)
-- Downloads the NPU LLM model (Llama 3.2 1B for Hexagon v68)
-- Creates a Python venv with all dependencies
-- Downloads the Piper TTS voice model
-- Deploys the custom wake word model
-- Installs systemd services (genie-server + voice-assistant)
-- Hardens the board (disables desktop, GPU, HDMI, snap, unnecessary services)
-- Sets CPU governor to performance
-- Tunes kernel parameters (swappiness, dirty pages)
-
-The script is **idempotent** — safe to re-run on an already-provisioned board. Each step checks whether work is already done and skips if so.
-
-### Updating a Deployed Board
-
-For routine code and model updates, use the deploy script from your dev machine:
+## Verifying audio on a running board
 
 ```bash
-./deploy.sh <board-ip>
-# or with explicit user
-./deploy.sh root@192.168.1.100
-```
+ssh trailcurrent@peregrine.local
+peregrine-self-test                # full audio + NPU + LLM + wake word check
 
-The script connects as `root` (the `assistant` user has no password — it exists only to run the service). It copies `assistant.py`, `genie_server.py`, the wake word model, and the systemd service files to the board, upgrades openwakeword, fixes file ownership, and reloads systemd. It creates a default `~/assistant.env` on first deploy but never overwrites it.
-
-After deploying, restart the service on the board:
-
-```bash
-systemctl restart voice-assistant
-journalctl -u voice-assistant -f
-```
-
-To re-run the full setup (e.g., after an OS update or to apply new hardening):
-
-```bash
-cd setup/
-./setup-board.sh
-```
-
-### Verify Audio
-
-Test audio hardware on the board (as root, or `su - assistant`):
-
-```bash
-# List audio devices
+# Or by hand
 aplay -l
 arecord -l
-
-# Speaker test
 speaker-test -t wav -c 2 -l 1
-
-# Record and playback
 arecord -d 5 -f S16_LE -r 16000 /tmp/test.wav && aplay /tmp/test.wav
 ```
 
-### Configure MQTT (optional)
+## Configuring MQTT
 
-To enable device control, edit the environment file on the board:
-
-```bash
-nano /home/assistant/assistant.env
-```
-
-Uncomment and fill in your MQTT broker details:
+The first-login wizard offers MQTT setup. To change it later:
 
 ```bash
-MQTT_BROKER=192.168.x.x
-MQTT_PORT=8883
-MQTT_USE_TLS=true
-MQTT_CA_CERT=/home/assistant/ca.pem
-MQTT_USERNAME=your_username
-MQTT_PASSWORD=your_password
+ssh trailcurrent@peregrine.local
+nano ~/assistant.env
+sudo systemctl restart voice-assistant
 ```
 
-Then restart the service:
-
-```bash
-systemctl restart voice-assistant
-```
-
-Without MQTT configured, the assistant still works for general questions — device control commands will just report "not connected."
-
-### Run Interactively
-
-```bash
-su - assistant
-~/assistant-env/bin/python3 ~/assistant.py
-```
-
-Say "Hey Peregrine" and ask a question or give a command.
-
-### Enable as a Service
-
-```bash
-systemctl start voice-assistant
-journalctl -u voice-assistant -f
-```
+Without MQTT configured, the assistant still answers general questions —
+device-control commands will just report "not connected."
 
 ## Voice Commands
 
@@ -354,13 +315,17 @@ cp output/hey_peregrine.onnx.data ../../models/
 After training, copy the model to the board:
 
 ```bash
-# Full deploy (code + model + service)
-./deploy.sh <board-ip>
+# Full deploy (code + model + service) — see image_build/docs/07-development.md
+./deploy.sh peregrine.local
 
 # Or model-only update
-scp models/hey_peregrine.onnx* root@<board-ip>:/home/assistant/models/
-ssh root@<board-ip> "chown assistant:assistant /home/assistant/models/hey_peregrine.onnx* && systemctl restart voice-assistant"
+scp models/hey_peregrine.onnx* trailcurrent@peregrine.local:/home/trailcurrent/models/
+ssh trailcurrent@peregrine.local "sudo systemctl restart voice-assistant"
 ```
+
+For a permanent install (so the new model survives a reflash), bake it into
+the next image build by leaving the new files in `models/` and re-running
+`sudo ./image_build/build.sh`.
 
 ## Third-Party Licenses
 

@@ -4,17 +4,20 @@ After=network.target
 
 [Service]
 Type=simple
-User=assistant
+User=trailcurrent
 Group=audio
 SupplementaryGroups=render
-WorkingDirectory=/home/assistant
-ExecStart=/usr/bin/python3 /home/assistant/genie_server.py
+WorkingDirectory=/home/trailcurrent
+ExecStart=/usr/bin/python3 /home/trailcurrent/genie_server.py
 Restart=on-failure
 RestartSec=5
 
-Environment=HOME=/home/assistant
+Environment=HOME=/home/trailcurrent
 Environment=PYTHONUNBUFFERED=1
-Environment=GENIE_DIR=/home/assistant/Llama3.2-1B-1024-v68
+Environment=GENIE_DIR=/home/trailcurrent/Llama3.2-1B-1024-v68
+
+# IMPORTANT: do NOT add ProtectSystem / ProtectHome / etc. here.
+# Hardening breaks /dev/fastrpc-* device access required by genie-t2t-run.
 
 [Install]
 WantedBy=multi-user.target

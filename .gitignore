@@ -21,11 +21,21 @@ assistant-env/
 !models/*.onnx
 !models/*.onnx.data
 
-# Audio artifacts
+# Recorded audio — NEVER commit recorded audio of any kind to this repo.
+# Synthetic / generated audio is fine in principle but the same blanket
+# applies for simplicity: keep all audio out of the repo.
 *.wav
 *.flac
 *.mp3
 *.raw
+*.ogg
+*.opus
+*.m4a
+*.aac
+*.aiff
+*.wma
+*.aup3
+*.aup3-bak
 
 # OS
 .DS_Store
@@ -63,15 +73,39 @@ CLAUDE.MD
 training/.mssnsd_cache/
 training/.musan_cache/
 
-# Voice clips (personal recordings — not for public repos)
+# Voice clips (personal recordings — never commit)
 training/real_clips/
 training/real_clips_negative/
+training/recordings/
+
+# Defensive: any future training subdir holding datasets, outputs, exports,
+# checkpoints, features, audacity projects, or audio. Belt-and-braces with
+# the per-extension blanket above so a fresh subdir can never leak data.
+training/**/data/
+training/**/output/
+training/**/export/
+training/**/checkpoints/
+training/**/features/
+training/**/recordings/
+training/**/*.npy
+training/**/*.npz
+training/**/*.h5
+training/**/*.ckpt
+training/**/*.pth
 
 # Image build artifacts (large — built from source)
-image_build/.cache/
+image_build/cache/
 image_build/output/
 
-# Stray audio/recording files in repo root
+# rsdk build outputs and externally-cloned keyrings (vendored source only)
+image_build/rsdk/out/
+image_build/rsdk/externals/keyrings/debian/
+image_build/rsdk/externals/keyrings/ubuntu/
+image_build/rsdk/externals/keyrings/radxa/
+image_build/rsdk/externals/keyrings/vscodium/
+
+# Stray audio/recording files (also covered by per-extension blanket above,
+# kept here for clarity since these were the originals)
 long_recording*
 karen_*
 **/*.FCBak

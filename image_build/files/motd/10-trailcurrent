@@ -1,0 +1,36 @@
+#!/bin/sh
+# TrailCurrent Peregrine — MOTD banner
+# Installed to /etc/update-motd.d/10-trailcurrent
+
+GREEN='\033[32m'
+BGREEN='\033[92m'
+TEAL='\033[38;5;30m'
+BOLD='\033[1m'
+GRAY='\033[38;5;245m'
+RESET='\033[0m'
+
+PEREGRINE_REL=""
+if [ -f /etc/peregrine-release ]; then
+    . /etc/peregrine-release
+    PEREGRINE_REL=" v${PEREGRINE_VERSION:-?}"
+fi
+
+UPTIME=$(uptime -p 2>/dev/null | sed 's/^up //')
+
+echo ""
+echo "${GREEN}                  /\\${RESET}"
+echo "${GREEN}                 /  \\${RESET}"
+echo "${GREEN}                /    \\${RESET}"
+echo "${GREEN}               /      \\${RESET}"
+echo "${GREEN}        /\\    /        \\${RESET}"
+echo "${GREEN}       /  \\  /          \\${RESET}"
+echo "${GREEN}      /    \\/            \\${RESET}"
+echo "${GREEN}     /                    \\${RESET}"
+echo "${GREEN}    /  ${BGREEN}~~~${GREEN}            ${BGREEN}~~~${GREEN}  \\${RESET}"
+echo "${GREEN}   / ${BGREEN}~~   ~~${GREEN}      ${BGREEN}~~~   ~~${GREEN} \\${RESET}"
+echo "${GREEN}  /____________________________\\${RESET}"
+echo ""
+echo "  ${BOLD}${GREEN}Trail${TEAL}Current${RESET} ${BOLD}Peregrine${RESET}${PEREGRINE_REL}"
+echo "  ${GRAY}Voice Assistant  |  Radxa Dragon Q6A${RESET}"
+[ -n "$UPTIME" ] && echo "  ${GRAY}up ${UPTIME}${RESET}"
+echo ""

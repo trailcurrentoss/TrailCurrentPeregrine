@@ -1,0 +1,18 @@
+[Unit]
+Description=TrailCurrent Peregrine first-boot setup (regen IDs, expand rootfs)
+DefaultDependencies=no
+After=systemd-remount-fs.service local-fs.target
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+ConditionPathExists=!/var/lib/peregrine/.firstboot-done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/peregrine-firstboot.sh
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=300
+
+[Install]
+WantedBy=sysinit.target

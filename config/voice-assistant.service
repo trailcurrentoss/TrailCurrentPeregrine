@@ -1,33 +1,31 @@
 [Unit]
-Description=Local Voice Assistant
+Description=TrailCurrent Peregrine Voice Assistant
 After=network.target sound.target genie-server.service
 Wants=genie-server.service
 
 [Service]
 Type=simple
-User=assistant
+User=trailcurrent
 Group=audio
-WorkingDirectory=/home/assistant
+WorkingDirectory=/home/trailcurrent
 ExecStartPre=/bin/sleep 5
-ExecStart=/home/assistant/assistant-env/bin/python3 /home/assistant/assistant.py
+ExecStart=/home/trailcurrent/assistant-env/bin/python3 /home/trailcurrent/assistant.py
 Restart=on-failure
 RestartSec=10
 
 # Environment
-Environment=HOME=/home/assistant
-# Wake word — custom "hey peregrine" model
-Environment=WAKE_MODEL_PATH=/home/assistant/models/hey_peregrine.onnx
-Environment=PATH=/home/assistant/assistant-env/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/trailcurrent
+Environment=WAKE_MODEL_PATH=/home/trailcurrent/models/hey_peregrine.onnx
+Environment=PATH=/home/trailcurrent/assistant-env/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
-# Site-specific config (MQTT, thresholds, etc.) lives in this file on the board.
-# It is never overwritten by deploys. Edit it with: nano ~/assistant.env
-EnvironmentFile=-/home/assistant/assistant.env
+# Site-specific config (MQTT, thresholds, etc.) — never overwritten by deploys.
+EnvironmentFile=-/home/trailcurrent/assistant.env
 
 # Hardening
 ProtectSystem=strict
-ReadWritePaths=/home/assistant /tmp
+ReadWritePaths=/home/trailcurrent /tmp
 ProtectHome=tmpfs
-BindPaths=/home/assistant
+BindPaths=/home/trailcurrent
 NoNewPrivileges=true
 
 [Install]
