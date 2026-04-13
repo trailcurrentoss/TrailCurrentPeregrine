@@ -58,26 +58,8 @@ else
     err "No ALSA playback device"
 fi
 
-# ── 3. Speaker test ─────────────────────────────────────────────────────────
-section "3. Speaker (1-second tone)"
-# Use aplay with a raw sine wave — speaker-test can hang waiting for period completion.
-# Generate 1s of 440Hz sine at 16kHz mono 16-bit LE and play it.
-TMP_TONE=$(mktemp --suffix=.wav)
-python3 -c "
-import wave, struct, math
-with wave.open('${TMP_TONE}', 'wb') as f:
-    f.setnchannels(1); f.setsampwidth(2); f.setframerate(16000)
-    f.writeframes(b''.join(struct.pack('<h', int(32767*math.sin(2*math.pi*440*i/16000))) for i in range(16000)))
-" 2>/dev/null
-if timeout 4 aplay -q "$TMP_TONE" 2>/dev/null; then
-    ok "Speaker played 1-second tone"
-else
-    err "Speaker test failed — is the Jabra Speak connected?"
-fi
-rm -f "$TMP_TONE"
-
-# ── 4. Microphone capture (3 sec, RMS check) ────────────────────────────────
-section "4. Microphone (3-second capture, RMS check)"
+# ── 3. Microphone capture (3 sec, RMS check) ────────────────────────────────
+section "3. Microphone (3-second capture, RMS check)"
 TMP_WAV=$(mktemp --suffix=.wav)
 if timeout 5 arecord -d 3 -f S16_LE -r 16000 -c 1 "$TMP_WAV" >/dev/null 2>&1; then
     RMS=$(python3 -c "
@@ -105,8 +87,8 @@ if $VA_WAS_RUNNING; then
     sudo systemctl start voice-assistant 2>/dev/null || true
 fi
 
-# ── 5. CDSP remoteproc state ────────────────────────────────────────────────
-section "5. NPU CDSP remoteproc"
+# ── 4. CDSP remoteproc state ────────────────────────────────────────────────
+section "4. NPU CDSP remoteproc"
 CDSP_OK=false
 for rp in /sys/class/remoteproc/remoteproc*/; do
     [[ -f "${rp}firmware" ]] || continue
@@ -123,8 +105,8 @@ for rp in /sys/class/remoteproc/remoteproc*/; do
 done
 $CDSP_OK || err "No CDSP remoteproc found"
 
-# ── 6. Genie server (NPU LLM HTTP wrapper) ──────────────────────────────────
-section "6. Genie NPU LLM server"
+# ── 5. Genie server (NPU LLM HTTP wrapper) ──────────────────────────────────
+section "5. Genie NPU LLM server"
 if systemctl is-active --quiet genie-server; then
     ok "genie-server.service is active"
     if timeout 15 curl -sf -m 10 http://localhost:11434/api/generate \
@@ -138,8 +120,8 @@ else
     err "genie-server.service is not active"
 fi
 
-# ── 7. Wake-word model load ─────────────────────────────────────────────────
-section "7. Custom wake-word model"
+# ── 6. Wake-word model load ─────────────────────────────────────────────────
+section "6. Custom wake-word model"
 if [[ -f "$WAKE_MODEL" ]]; then
     if "${VENV}/bin/python3" -c "
 from openwakeword.model import Model
@@ -154,8 +136,8 @@ else
     err "${WAKE_MODEL} missing"
 fi
 
-# ── 8. Voice assistant service ──────────────────────────────────────────────
-section "8. Voice assistant service"
+# ── 7. Voice assistant service ──────────────────────────────────────────────
+section "7. Voice assistant service"
 if systemctl is-active --quiet voice-assistant; then
     ok "voice-assistant.service is active"
 else

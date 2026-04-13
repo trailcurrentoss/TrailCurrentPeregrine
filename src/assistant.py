@@ -41,6 +41,7 @@ SAMPLE_RATE = 16000
 CHUNK = 1280  # 80ms at 16kHz
 WAKE_THRESHOLD = float(os.getenv("WAKE_THRESHOLD", "0.85"))
 WAKE_ACTIVATIONS = int(os.getenv("WAKE_ACTIVATIONS", "3"))  # consecutive frames above threshold
+WAKE_MIN_RMS = int(os.getenv("WAKE_MIN_RMS", "300"))  # skip model if chunk is quieter than this
 SILENCE_THRESHOLD = int(os.getenv("SILENCE_THRESHOLD", "500"))
 SILENCE_DURATION = float(os.getenv("SILENCE_DURATION", "1.5"))
 MAX_RECORD_SECONDS = 15
@@ -71,7 +72,7 @@ BASE_SYSTEM_PROMPT = (
 print("=" * 50)
 print("Voice Assistant Starting")
 print("=" * 50)
-print(f"  Wake word:  {WAKE_MODEL} (threshold={WAKE_THRESHOLD}, activations={WAKE_ACTIVATIONS})")
+print(f"  Wake word:  {WAKE_MODEL} (threshold={WAKE_THRESHOLD}, activations={WAKE_ACTIVATIONS}, min_rms={WAKE_MIN_RMS})")
 print(f"  STT model:  {WHISPER_SIZE}")
 print(f"  LLM model:  {OLLAMA_MODEL}")
 print(f"  TTS model:  {os.path.basename(PIPER_MODEL)}")
@@ -1982,10 +1983,19 @@ def listen_for_wake_word(ignore_seconds=0):
             consecutive = 0
             continue
         samples = np.frombuffer(data, dtype=np.int16)
-        result = wake_model.predict(samples)
         chunk_count += 1
         if chunk_count <= ignore_chunks:
             continue
+        # Skip the model entirely for quiet chunks (sighs, soft ambient noise).
+        # This also resets any partial activation streak so a sigh can't
+        # prime the counter and then a second quiet event completes it.
+        rms = np.abs(samples).mean()
+        if rms < WAKE_MIN_RMS:
+            if consecutive > 0:
+                print(f"  Chunk below RMS gate ({rms:.0f}<{WAKE_MIN_RMS}), resetting {consecutive} activation(s)")
+            consecutive = 0
+            continue
+        result = wake_model.predict(samples)
         triggered = False
         for name, score in result.items():
             if WAKE_MODEL in name and score > WAKE_THRESHOLD:
