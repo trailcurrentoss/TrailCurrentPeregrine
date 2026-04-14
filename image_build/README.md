@@ -30,23 +30,22 @@ sudo apt install -y jsonnet bdebstrap libguestfs-tools \
 #    If your NVMe uses 4096-byte sectors: add --sector-size 4096
 sudo ./image_build/build.sh
 
-# 3. Put board in EDL mode (hold EDL button while powering on USB-C)
-lsusb | grep 9008   # verify
-
-# 4. Flash SPI NOR firmware (one-time per board)
-sudo ./image_build/flash.sh --firmware
-
-# 5. Flash the OS image to NVMe
+# 3. Flash the image — pick one:
+#
+#    Option A (easiest): remove NVMe, put in USB enclosure, flash with Balena Etcher
+#
+#    Option B (Linux only, NVMe stays in board):
+#      Put board in EDL mode (hold EDL button while connecting USB-C)
 sudo ./image_build/flash.sh --os image_build/output/peregrine-q6a-v1.0.img
 
-# 6. Disconnect USB, connect Ethernet + 12V power, wait ~3 min
+# 4. Connect Ethernet + 12V power, wait ~3 min
 
-# 7. SSH in and run the wizard
+# 5. SSH in and run the wizard
 ssh trailcurrent@peregrine.local
 # Default password: trailcurrent
 # (the wizard forces a change on first login)
 
-# 8. Say "hey peregrine"
+# 6. Say "hey peregrine"
 ```
 
 ## What you get

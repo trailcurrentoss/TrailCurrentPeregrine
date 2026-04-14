@@ -1,151 +1,150 @@
 # 3. Flashing a board
 
-Flashing a fresh Radxa Dragon Q6A is a **two-step process**:
+You have two options depending on what hardware you have available. Both produce
+the same result — pick whichever is easier.
 
-1. **SPI NOR firmware** (one-time per board) — writes the EDK2 UEFI bootloader.
-   Without this, the board cannot boot from any storage.
-2. **OS image** (every reflash) — writes the Peregrine image to the M.2 NVMe.
+| | Path A: NVMe enclosure | Path B: EDL over USB |
+|---|---|---|
+| **Extra hardware** | USB M.2 enclosure | USB-C data cable |
+| **NVMe removal** | Yes — remove, flash, reinstall | No — stays in board |
+| **OS** | Windows / Mac / Linux | Linux only |
+| **Tool** | Balena Etcher (or any disk imager) | `flash.sh` |
 
-Both steps go over USB-C using Qualcomm's EDL (Emergency Download) protocol.
-The `flash.sh` helper wraps the underlying `edl-ng` calls with safe defaults.
+---
 
-## Hardware needed
+## Path A: NVMe enclosure + Balena Etcher
 
-- Radxa Dragon Q6A board
-- M.2 NVMe SSD (128 GB minimum, 256 GB recommended) installed in the M.2 slot
-- USB-C cable (data, not charge-only)
-- 12V DC power supply (used after flashing, not during)
-- A Linux build host where you ran `build.sh`
+1. Power down the Q6A.
+2. Remove the NVMe SSD from the M.2 slot and install it in a USB enclosure.
+3. Open [Balena Etcher](https://etcher.balena.io/). Select **Flash from file**
+   and choose `image_build/output/peregrine-q6a-v1.0.img`.
+4. Select the NVMe enclosure as the target and click **Flash**.
+   Takes 3–8 minutes.
+5. Remove the NVMe from the enclosure and reinstall it in the Q6A.
 
-## NVMe sector size
+→ Skip to [First boot](#first-boot).
 
-The image must be built with a sector size that matches your NVMe drive's
-**logical** sector size. Most consumer drives use **512 bytes** (the default).
-Some enterprise/datacenter drives use **4096 bytes**.
+---
 
-If you're not sure, check the drive's spec sheet, or if the drive is
-accessible from a Linux machine:
+## Path B: EDL over USB (Linux only)
 
-```bash
-# From the build host (if the NVMe is in a USB enclosure)
-sudo nvme id-ns /dev/nvmeXn1 -H | grep "LBA Format"
+### Enter EDL mode
 
-# Or more simply
-cat /sys/block/nvmeXn1/queue/logical_block_size
-```
+**Brand-new board:** boots into EDL automatically when powered via USB-C.
+No button press needed.
 
-A value of `512` means build with the default. A value of `4096` means:
+**Already-flashed board:** hold the **EDL button** (small button next to the
+USB-C port) while connecting USB-C. Release after ~2 seconds.
 
-```bash
-sudo ./image_build/build.sh --sector-size 4096
-```
-
-**If you flash and the board drops to a UEFI `Shell>` prompt with no `FSx:`
-entries in `map -r`**, you almost certainly have the wrong sector size.
-See [06-troubleshooting.md](06-troubleshooting.md#flash-succeeds-but-board-drops-to-uefi-shell).
-
-## Step 0: Allow USB access to the EDL device
-
-EDL mode exposes the board as USB ID `05c6:9008`. By default that requires
-root, but you can let your user access it without sudo:
-
-```bash
-echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="05c6", ATTR{idProduct}=="9008", MODE="0666"' \
-  | sudo tee /etc/udev/rules.d/51-edl.rules
-sudo udevadm control --reload-rules
-```
-
-(Optional but recommended.)
-
-## Step 1: Enter EDL mode
-
-There are two cases:
-
-### Brand-new board (never flashed)
-
-A board with no firmware boots into EDL automatically when powered on via
-USB-C. No button press needed.
-
-### Already-flashed board
-
-Hold the **EDL button** (small button on the PCB next to the USB-C port)
-while connecting USB-C. Release after ~2 seconds.
-
-### Verify
+Verify:
 
 ```bash
 lsusb | grep 9008
+# Bus 002 Device 015: ID 05c6:9008 Qualcomm, Inc. Gobi Wireless Modem (QDL mode)
 ```
 
-You should see:
+If nothing appears, disconnect, hold the EDL button, and reconnect.
 
-```
-Bus 002 Device 015: ID 05c6:9008 Qualcomm, Inc. Gobi Wireless Modem (QDL mode)
-```
-
-If you see nothing, the board is not in EDL mode — disconnect, hold the EDL
-button, reconnect.
-
-## Step 2: Flash SPI NOR firmware (one-time)
-
-```bash
-sudo ./image_build/flash.sh --firmware
-```
-
-This writes the EDK2 UEFI bootloader, TrustZone, hypervisor, and other
-Qualcomm firmware components to the on-board SPI NOR. Takes ~30 seconds.
-
-**Skip this step on subsequent reflashes** — the SPI NOR is non-volatile
-and the firmware never changes for Peregrine.
-
-The firmware files come from `image_build/firmware/` (committed to the repo).
-The script extracts them on the fly into `/tmp/peregrine-flash/` and
-invokes `edl-ng rawprogram`.
-
-## Step 3: Flash the OS image to NVMe
+### Flash
 
 ```bash
 sudo ./image_build/flash.sh --os image_build/output/peregrine-q6a-v1.0.img
 ```
 
-This writes the entire ~6 GB image (including the GPT, EFI partition, and
-rootfs) starting at sector 0 of the NVMe. Takes 3–8 minutes depending on USB
-throughput.
+Takes 3–8 minutes. Once complete, disconnect the USB-C cable.
 
-**The board must still be in EDL mode for this step.** If you rebooted between
-steps 2 and 3, hold the EDL button and re-power the board first.
+---
 
-## Step 4: Boot for the first time
+## First boot
 
-1. **Disconnect the USB-C cable** from the Q6A.
-2. Connect Ethernet.
-3. Apply 12V DC power.
-4. Wait ~3 minutes for the first-boot service to complete (it expands the
-   root partition, regenerates SSH host keys, and reboots once).
-
-The board's hostname is `peregrine` and it advertises via mDNS, so you can
-SSH in by hostname:
+1. Connect Ethernet.
+2. Apply 12V DC power.
+3. Wait ~3 minutes — the first-boot service expands the root partition,
+   regenerates SSH host keys, and reboots once automatically.
 
 ```bash
 ssh trailcurrent@peregrine.local
+# Default password: trailcurrent
+# The first-login wizard forces a password change immediately.
 ```
 
-Default password is `trailcurrent`. The first-login wizard will force a
-password change immediately.
+If `peregrine.local` doesn't resolve, find the board's IP on your router.
 
-If `peregrine.local` doesn't resolve (some networks block mDNS), find the
-board on your DHCP server or LAN router and use its IP.
+---
 
-## Troubleshooting flash
+## NVMe sector size
+
+The image must match your NVMe's **logical** sector size. Most drives use
+**512 bytes** (the default). Some enterprise drives use **4096 bytes**.
+
+Check with the drive in a USB enclosure:
+
+```bash
+cat /sys/block/nvmeXn1/queue/logical_block_size
+```
+
+If it returns `4096`, rebuild with:
+
+```bash
+sudo ./image_build/build.sh --sector-size 4096
+```
+
+**If the board boots to a UEFI `Shell>` prompt**, this is almost certainly the
+cause. See [06-troubleshooting.md](06-troubleshooting.md#flash-succeeds-but-board-drops-to-uefi-shell).
+
+---
+
+## SPI NOR firmware (rarely needed)
+
+The Q6A ships from Radxa with SPI boot firmware pre-flashed. **Most users
+never need to touch this.**
+
+### When it's needed
+
+Update the SPI firmware if you see any of the following:
+
+- **Board purchased before October 2025** — Radxa updated the firmware in late
+  2025. Older boards shipped with an earlier version that may not boot newer OS
+  images correctly.
+- **Board powers on but never boots** — fans/LEDs come on, Ethernet link
+  activates, but `peregrine.local` never appears and SSH never responds, even
+  after waiting 5+ minutes.
+- **Board drops to a UEFI `Shell>` prompt** and you've already confirmed the
+  NVMe sector size is correct (see above) — a stale bootloader is the next
+  most likely cause.
+
+If you're unsure which firmware version is on your board, check the
+[Radxa Dragon Q6A SPI firmware docs](https://docs.radxa.com/en/dragon/q6a/low-level-dev/spi-fw)
+— they document the current required version and how to identify what's
+installed.
+
+### How to update
+
+This must be done via EDL mode from a Linux machine. It cannot be performed
+from within a running Peregrine install — the SPI NOR is not writable from
+the booted OS without special tooling that is not included in our image.
+
+```bash
+# 1. Put the board in EDL mode (see Path B above)
+# 2. Flash the firmware
+sudo ./image_build/flash.sh --firmware
+# 3. Reflash the OS image as normal (firmware flash does not write the NVMe)
+sudo ./image_build/flash.sh --os image_build/output/peregrine-q6a-v1.0.img
+```
+
+---
+
+## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Could not connect to device` | USB cable is charge-only | Use a USB-C data cable |
-| `lsusb` doesn't show 9008 | Board not in EDL mode | Hold EDL button while powering on |
-| `Permission denied` opening `/dev/bus/usb/...` | Missing udev rule | See Step 0 |
-| `rawprogram*.xml: No such file` | Firmware archive corrupted | Re-run preflight to verify firmware/ |
-| Flash hangs at 0% | NVMe not seated properly | Re-seat the M.2 module |
-| Flash succeeds but board doesn't boot | SPI NOR firmware not flashed | Run `flash.sh --firmware` first |
+| Etcher shows NVMe as read-only | Enclosure write-protect switch | Check the enclosure's lock switch |
+| `lsusb` doesn't show `9008` | Board not in EDL mode | Hold EDL button while connecting USB-C |
+| `Could not connect to device` | Charge-only USB-C cable | Use a data-capable cable |
+| `Permission denied` on `/dev/bus/usb/...` | No udev rule | `echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="05c6", ATTR{idProduct}=="9008", MODE="0666"' \| sudo tee /etc/udev/rules.d/51-edl.rules && sudo udevadm control --reload-rules` |
+| Flash hangs at 0% | NVMe not seated | Re-seat the M.2 module |
+| Board drops to UEFI `Shell>` | Wrong sector size | Rebuild with correct `--sector-size` |
+| Board doesn't boot at all | Old SPI firmware | See SPI NOR section above |
 
 ## Next
 

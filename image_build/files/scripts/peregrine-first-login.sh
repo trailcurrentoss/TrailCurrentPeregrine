@@ -2,8 +2,8 @@
 # ============================================================================
 # TrailCurrent Peregrine — First-login wizard
 # Runs on the first interactive SSH/console login as the trailcurrent user.
-# Forces a password change, then optionally configures MQTT, static IP, and
-# runs a hardware self-test. Idempotent — safe to re-run if the user deletes
+# Forces a password change then optionally configures MQTT.
+# Idempotent — safe to re-run if the user deletes
 # the completion flag.
 # ============================================================================
 
@@ -122,46 +122,7 @@ else
     ok "Skipped MQTT"
 fi
 
-# ── Step 3: Static IP (optional) ────────────────────────────────────────────
-section "Network (optional)"
-
-read -rp "  Configure a static IP? [y/N]: " yn
-if [[ "${yn,,}" == "y" || "${yn,,}" == "yes" ]]; then
-    read -rp "  Address with prefix (e.g. 192.168.1.50/24): " STATIC_IP
-    read -rp "  Gateway (e.g. 192.168.1.1): " GATEWAY
-    read -rp "  DNS server [1.1.1.1]: " DNS
-    DNS="${DNS:-1.1.1.1}"
-
-    if [[ -n "$STATIC_IP" && -n "$GATEWAY" ]]; then
-        CON=$(nmcli -t -f NAME,TYPE con show | grep ':ethernet$' | head -1 | cut -d: -f1)
-        if [[ -n "$CON" ]]; then
-            sudo nmcli con mod "$CON" \
-                ipv4.method manual \
-                ipv4.addresses "$STATIC_IP" \
-                ipv4.gateway "$GATEWAY" \
-                ipv4.dns "$DNS" && \
-            sudo nmcli con up "$CON" && \
-            ok "Static IP configured on $CON"
-        else
-            warn "No wired connection profile found — configure manually with nmcli"
-        fi
-    fi
-else
-    ok "Keeping DHCP"
-fi
-
-# ── Step 4: Self-test (optional) ────────────────────────────────────────────
-section "Hardware self-test (optional)"
-
-read -rp "  Run hardware self-test now? [Y/n]: " yn
-if [[ "${yn,,}" != "n" && "${yn,,}" != "no" ]]; then
-    /usr/local/bin/peregrine-self-test.sh || \
-        warn "Self-test reported issues — see output above"
-else
-    ok "Skipped self-test (run later with: peregrine-self-test)"
-fi
-
-# ── Step 5: Restart services and wrap up ───────────────────────────────────
+# ── Step 3: Restart services and wrap up ───────────────────────────────────
 section "Starting voice assistant"
 
 sudo systemctl restart genie-server voice-assistant 2>/dev/null || \
