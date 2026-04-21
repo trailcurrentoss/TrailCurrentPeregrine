@@ -306,7 +306,16 @@ function(
                 echo "[hook 11] staging application code"
                 STAGING="${PEREGRINE_STAGING:-/tmp/peregrine-staging}"
                 install -m 644 "$STAGING/src/assistant.py" "$1/home/trailcurrent/assistant.py"
+                install -m 644 "$STAGING/src/tts.py"       "$1/home/trailcurrent/tts.py"
                 install -m 644 "$STAGING/src/genie_server.py" "$1/home/trailcurrent/genie_server.py"
+                # Benchmarking / CPU-unlock helper (bench only)
+                if [ -f "$STAGING/files/scripts/peregrine-unleash.sh" ]; then
+                    install -m 755 "$STAGING/files/scripts/peregrine-unleash.sh" \
+                        "$1/usr/local/sbin/peregrine-unleash"
+                fi
+                # On-disk Piper TTS cache dir (populated on first run)
+                install -d -o trailcurrent -g trailcurrent -m 755 \
+                    "$1/home/trailcurrent/.cache/peregrine-tts"
             |||,
 
             // ════════════════════════════════════════════════════════════════
@@ -683,6 +692,7 @@ function(
                     fi
                 }
                 check "$1" /home/trailcurrent/assistant.py
+                check "$1" /home/trailcurrent/tts.py
                 check "$1" /home/trailcurrent/genie_server.py
                 check "$1" /home/trailcurrent/assistant.env
                 check "$1" /home/trailcurrent/models/hey_peregrine.onnx

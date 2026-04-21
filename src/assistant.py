@@ -29,6 +29,9 @@ from openwakeword.model import Model as WakeModel
 from faster_whisper import WhisperModel
 import requests
 
+# Peregrine-local module, installed alongside assistant.py
+from tts import TTSEngine
+
 # --- Config (override via environment variables) ---
 WAKE_MODEL = os.getenv("WAKE_MODEL", "hey_peregrine")
 WHISPER_SIZE = os.getenv("WHISPER_SIZE", "base.en")
@@ -36,6 +39,9 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b-npu")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 PIPER_MODEL = os.getenv("PIPER_MODEL",
     os.path.expanduser("~/piper-voices/en_US-libritts_r-medium.onnx"))
+TTS_CACHE_DIR = os.getenv("TTS_CACHE_DIR",
+    os.path.expanduser("~/.cache/peregrine-tts"))
+TTS_USE_ENGINE = os.getenv("TTS_USE_ENGINE", "1").lower() not in ("0", "false", "no")
 
 SAMPLE_RATE = 16000
 CHUNK = 1280  # 80ms at 16kHz
@@ -54,18 +60,21 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 MQTT_CA_CERT = os.getenv("MQTT_CA_CERT", "")  # path to ca.pem for self-signed certs
 MQTT_USE_TLS = os.getenv("MQTT_USE_TLS", "true").lower() in ("true", "1", "yes")
 
+# Knowledge base config
+KNOWLEDGE_BASE_PATH = os.getenv("KNOWLEDGE_BASE_PATH",
+    os.path.expanduser("~/knowledge/chunks.json"))
+
+_kb_chunks: list = []
+_kb_vectorizer = None   # TfidfVectorizer fitted at startup
+_kb_matrix = None       # sparse CSR matrix: n_chunks × vocab
+
 BASE_SYSTEM_PROMPT = (
-    "You are a voice assistant for a vehicle and trailer system called TrailCurrent. "
-    "You can control lights and read sensor data. "
-    "Keep answers concise and conversational, ideally under 3 sentences. "
-    "Do not use markdown, bullet points, or formatting since your response will be spoken aloud.\n\n"
-    "When the user wants to control a device, respond ONLY with a JSON object on a single line, nothing else:\n"
-    "- Turn lights on/off: {\"action\": \"light\", \"id\": \"all\", \"state\": 1}\n"
-    "  (id can be \"all\" or a number like \"1\", \"2\". state: 1 means on, 0 means off)\n"
-    "- Set brightness: {\"action\": \"light\", \"id\": \"1\", \"brightness\": 50}\n"
-    "  (brightness is 0-100 percent. Only works per-light, not \"all\")\n\n"
-    "When the user asks about sensor data, use the current readings below to answer conversationally.\n"
-    "If no sensor data is available, say you don't have that information yet.\n\n"
+    "You are Peregrine, voice assistant for TrailCurrent, a 100% open source Software Defined Vehicle platform "
+    "(community-developed; Waveshare/Espressif supply hardware only). "
+    "Give short plain-speech answers. "
+    "Device control: output only {\"action\":\"light\",\"id\":\"all\",\"state\":1} "
+    "or {\"action\":\"light\",\"id\":\"1\",\"brightness\":50} — no other text. "
+    "id is \"all\" or a number; state 1=on 0=off; brightness 0-100 for individual lights only.\n\n"
 )
 
 # --- Init ---
@@ -106,6 +115,75 @@ print("Loading Whisper STT model...")
 _CPU_THREADS = int(os.getenv("CPU_THREADS", "8"))
 whisper_model = WhisperModel(WHISPER_SIZE, device="cpu", compute_type="int8",
                              cpu_threads=_CPU_THREADS)
+
+print("Loading knowledge base...")
+def _load_knowledge_base():
+    """Load chunks.json and fit a TF-IDF index for offline documentation retrieval."""
+    global _kb_chunks, _kb_vectorizer, _kb_matrix
+    if not os.path.isfile(KNOWLEDGE_BASE_PATH):
+        print(f"  Knowledge base not found at {KNOWLEDGE_BASE_PATH} — skipping")
+        return
+    try:
+        import json as _json
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        t0 = time.monotonic()
+        with open(KNOWLEDGE_BASE_PATH, encoding="utf-8") as f:
+            _kb_chunks = _json.load(f)
+        texts = [c["text"] for c in _kb_chunks]
+        _kb_vectorizer = TfidfVectorizer(max_features=8000, ngram_range=(1, 2))
+        _kb_matrix = _kb_vectorizer.fit_transform(texts)
+        elapsed = time.monotonic() - t0
+        print(f"  Knowledge base loaded: {len(_kb_chunks)} chunks ({elapsed:.1f}s)")
+    except Exception as e:
+        print(f"  Knowledge base load failed: {e}")
+
+_load_knowledge_base()
+
+
+# TrailCurrent module names — used to boost retrieval when query names a module
+_TC_MODULES = {
+    "bearing", "borealis", "plateau", "ampline", "picket", "tapper",
+    "torrent", "solstice", "aftline", "therma", "switchback", "reservoir",
+    "milepost", "fireside", "headwaters", "farwatch", "peregrine", "spotter",
+}
+_MODULE_BOOST = 0.15  # added to TF-IDF score when chunk source/text mentions the queried module
+
+
+def retrieve_knowledge(query: str, top_k: int = 2, min_score: float = 0.10) -> list:
+    """Return up to top_k documentation chunk texts relevant to query.
+
+    Uses TF-IDF cosine similarity with a module-name boost: if the query
+    names a known TrailCurrent module, chunks whose source or text mention
+    that module receive a score bonus. This compensates for TF-IDF's poor
+    handling of short "what is X" queries where X is the only signal.
+    Returns an empty list if the knowledge base is not loaded or no chunk
+    meets min_score, so callers can treat it as optional context.
+    """
+    if _kb_vectorizer is None or _kb_matrix is None or not _kb_chunks:
+        return []
+    try:
+        from sklearn.metrics.pairwise import cosine_similarity
+        import numpy as np
+        q_vec = _kb_vectorizer.transform([query])
+        scores = cosine_similarity(q_vec, _kb_matrix)[0].copy()
+
+        # Boost chunks that mention the same module(s) named in the query
+        q_lower = query.lower()
+        for module in _TC_MODULES:
+            if module in q_lower:
+                for i, chunk in enumerate(_kb_chunks):
+                    chunk_text = (chunk.get("source", "") + " " + chunk.get("text", "")).lower()
+                    if module in chunk_text:
+                        scores[i] += _MODULE_BOOST
+
+        top_indices = np.argsort(scores)[::-1][:top_k]
+        return [
+            _kb_chunks[i]["text"]
+            for i in top_indices
+            if scores[i] >= min_score
+        ]
+    except Exception:
+        return []
 
 
 # --- Audio I/O via arecord / aplay (replaces PyAudio) ---
@@ -675,15 +753,33 @@ def get_sensor_summary():
     return "Current sensor readings:\n" + "\n".join(lines)
 
 
-def get_system_prompt():
-    """Build the full system prompt with current sensor data."""
+def get_system_prompt(knowledge_context=None):
+    """Build the full system prompt with current sensor data.
+
+    knowledge_context: optional list of documentation chunk strings retrieved
+    from the knowledge base. Injected between the base prompt and sensor data
+    so the LLM can answer questions about the TrailCurrent system offline.
+    """
     if not MQTT_BROKER:
-        return (
+        base = (
             "You are a helpful voice assistant. Keep answers concise and conversational, "
             "ideally under 3 sentences. Do not use markdown, bullet points, or formatting "
             "since your response will be spoken aloud."
         )
-    prompt = BASE_SYSTEM_PROMPT + get_sensor_summary()
+        if knowledge_context:
+            base += "\n\nUse the following TrailCurrent documentation to answer the question. Base your answer on this, not on assumptions:\n"
+            base += "\n---\n".join(knowledge_context)
+            base += "\n"
+        return base
+
+    prompt = BASE_SYSTEM_PROMPT
+
+    if knowledge_context:
+        prompt += "Use the following TrailCurrent documentation to answer the question. Base your answer on this, not on assumptions:\n"
+        prompt += "\n---\n".join(knowledge_context)
+        prompt += "\n\n"
+
+    prompt += get_sensor_summary()
 
     # Append device registry so the LLM knows device names and types
     if _device_registry:
@@ -812,6 +908,7 @@ def _execute_relay_all_command(state):
     # Use the all-relays command topic — Headwaters sends explicit set-all CAN bytes
     # to every Switchback instance, avoiding per-channel toggle side-effects.
     topic = "local/relays/all/command"
+    payload = json.dumps({"state": state})
     mqtt.publish(topic, payload)
     print(f"  MQTT publish: {topic} -> {payload}")
     return f"Turning {state_word} all relays."
@@ -1834,34 +1931,79 @@ def match_intent(text):
                 return f"We're currently tracking {details['numberOfSatellites']} satellites."
             return "I don't have satellite data right now."
 
+    # --- Module identity queries ("what is Borealis?", "what does Torrent do?") ---
+    # Handled here to prevent the 1B model's incorrect training priors
+    # (e.g. "Borealis = Aurora Borealis = light") from overriding factual answers.
+    _MODULE_DESCRIPTIONS = {
+        "bearing":    "Bearing is a GNSS module. It provides GPS positioning, heading, altitude, and precise timing over the CAN bus.",
+        "borealis":   "Borealis is an air quality sensor. It measures temperature, humidity, TVOC, and CO2. It is read-only and cannot control anything.",
+        "plateau":    "Plateau is a vehicle leveling sensor. It measures tilt on both axes and calculates how many inches each corner is off level.",
+        "ampline":    "Ampline is a battery shunt gateway. It measures voltage, current, power, and state of charge from a shunt on your battery bank.",
+        "picket":     "Picket is a door and cabinet sensor module. It monitors open and closed states for up to several doors or compartments.",
+        "tapper":     "Tapper is an 8-button control panel. Pressing its buttons sends commands to control lights or relays on the CAN bus.",
+        "torrent":    "Torrent is an 8-channel PWM power distribution module. It controls vehicle lighting and accessories with on/off and brightness control.",
+        "solstice":   "Solstice is a solar MPPT charge controller gateway. It reads data from a Victron MPPT controller and publishes it to the CAN bus.",
+        "aftline":    "Aftline is a trailer wiring monitor. It detects the state of trailer connector pins to verify lighting and brake connections.",
+        "therma":     "Therma is a closed-loop thermostat controller. It drives a relay to maintain a target temperature using a temperature sensor.",
+        "switchback":  "Switchback is an 8-channel relay module. It can switch higher-current loads on and off, such as appliances or accessory circuits.",
+        "reservoir":  "Reservoir monitors water tank levels using ultrasonic sensors. It can track fresh, grey, and black water tanks.",
+        "milepost":   "Milepost is a hardwired 7-inch touchscreen display. It shows vehicle status and allows local control without needing a phone or app.",
+        "fireside":   "Fireside is a wireless 7-inch touchscreen display. It connects over WiFi and MQTT to show status and provide control.",
+        "headwaters": "Headwaters is the in-vehicle compute gateway. It runs on a Raspberry Pi CM5 and hosts the MQTT broker, tile server, CAN bridge, and Docker services.",
+        "farwatch":   "Farwatch is the optional cloud platform. It is a self-hosted web app for remote monitoring and control when the vehicle has internet access.",
+        "peregrine":  "Peregrine is the voice assistant you are talking to. It runs on a Radxa Dragon Q6A and uses a local LLM on the Hexagon NPU.",
+        "spotter":    "Spotter is a compact trailer monitor display. It shows towing alarms and offers remote control for the trailer being towed.",
+        "trailcurrent": "TrailCurrent is a 100% open source Software Defined Vehicle platform. It is community-developed and provides a complete system for vehicle monitoring, control, and autonomous decision-making.",
+    }
+    _MODULE_QUERY_RE = re.compile(
+        r'\b(what\s+(is|are|does|do)|tell me about|describe|explain)\b',
+        re.IGNORECASE
+    )
+    if _MODULE_QUERY_RE.search(text):
+        text_lower = text.lower()
+        for name, description in _MODULE_DESCRIPTIONS.items():
+            if re.search(r'\b' + re.escape(name) + r'\b', text_lower):
+                print(f"  Intent: module identity query ({name})")
+                return description
+
     return None  # No intent matched, fall back to LLM
 
 
 def _extract_json_objects(text):
-    """Extract all JSON objects from a string (handles multiple on separate lines)."""
+    """Extract JSON command objects from a response.
+
+    The system prompt instructs the model to respond with ONLY a JSON object
+    when issuing a command — no prose, no explanation. We enforce that contract
+    here: a response only counts as a command if the entire response (after
+    stripping whitespace) is one or more JSON objects, with no surrounding text.
+
+    This prevents stray JSON examples in prose answers (e.g. documentation
+    about command syntax) from being accidentally executed as commands.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    # Only attempt extraction if the whole response looks like JSON
+    # (starts with { and ends with }, possibly with multiple objects on
+    # separate lines — but no interleaved prose)
+    lines = [l.strip() for l in stripped.splitlines() if l.strip()]
+    if not lines:
+        return []
+
+    # Reject immediately if any line doesn't start with { or }
+    # (prose responses always start with words, not braces)
+    if not all(l.startswith("{") or l.startswith("}") or l == "" for l in lines):
+        return []
+
     objects = []
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # Try the whole line
+    for line in lines:
         try:
             obj = json.loads(line)
             if isinstance(obj, dict):
                 objects.append(obj)
-                continue
         except (json.JSONDecodeError, ValueError):
             pass
-        # Try extracting {...} from within the line
-        start = line.find("{")
-        end = line.rfind("}") + 1
-        if start >= 0 and end > start:
-            try:
-                obj = json.loads(line[start:end])
-                if isinstance(obj, dict):
-                    objects.append(obj)
-            except (json.JSONDecodeError, ValueError):
-                pass
     return objects
 
 
@@ -1949,11 +2091,41 @@ def _kill_arecord():
 
 
 def play_beep(wav_path=None):
-    """Play a pre-generated beep WAV."""
+    """Play a pre-generated beep WAV (blocking)."""
     if wav_path is None:
         wav_path = BEEP_WAKE_WAV
     if not _play_wav(wav_path):
         print("  (beep failed)")
+
+
+def play_beep_async(wav_path=None):
+    """Fire a beep WAV without waiting for it to finish.
+
+    Lets the caller immediately proceed to heavy work (STT, TTS) while the
+    short beep plays over it. The spawned process is orphaned by design — it
+    exits on its own after the WAV ends.
+    """
+    if wav_path is None:
+        wav_path = BEEP_WAKE_WAV
+    # Try paplay first (matches _play_wav behaviour), fall back to aplay.
+    try:
+        if _has_pulseaudio:
+            subprocess.Popen(["paplay", wav_path],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return
+    except Exception:
+        pass
+    try:
+        cmd = ["aplay", "-q"]
+        if _alsa_playback_device:
+            cmd += ["-D", _alsa_playback_device]
+        cmd.append(wav_path)
+        subprocess.Popen(cmd,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 
 def listen_for_wake_word(ignore_seconds=0):
@@ -1971,6 +2143,7 @@ def listen_for_wake_word(ignore_seconds=0):
     ignore_chunks = int(ignore_seconds * SAMPLE_RATE / CHUNK)
     chunk_count = 0
     consecutive = 0
+    quiet_streak = 0
     chunk_bytes = CHUNK * 2  # 16-bit = 2 bytes per sample
     while True:
         data = proc.stdout.read(chunk_bytes)
@@ -1981,20 +2154,25 @@ def listen_for_wake_word(ignore_seconds=0):
             time.sleep(0.5)
             proc = _ensure_arecord()
             consecutive = 0
+            quiet_streak = 0
             continue
         samples = np.frombuffer(data, dtype=np.int16)
         chunk_count += 1
         if chunk_count <= ignore_chunks:
             continue
-        # Skip the model entirely for quiet chunks (sighs, soft ambient noise).
-        # This also resets any partial activation streak so a sigh can't
-        # prime the counter and then a second quiet event completes it.
+        # Skip model inference on quiet chunks to save CPU on truly silent
+        # audio. Tolerate a single sub-gate chunk mid-activation (inter-phoneme
+        # silences in 'hey peregrine') — only reset after two consecutive
+        # quiet chunks so a sustained silence still rejects a prior cough.
         rms = np.abs(samples).mean()
         if rms < WAKE_MIN_RMS:
-            if consecutive > 0:
-                print(f"  Chunk below RMS gate ({rms:.0f}<{WAKE_MIN_RMS}), resetting {consecutive} activation(s)")
-            consecutive = 0
+            quiet_streak += 1
+            if quiet_streak >= 2 and consecutive > 0:
+                print(f"  Sustained quiet ({rms:.0f}<{WAKE_MIN_RMS}), "
+                      f"resetting {consecutive} activation(s)")
+                consecutive = 0
             continue
+        quiet_streak = 0
         result = wake_model.predict(samples)
         triggered = False
         for name, score in result.items():
@@ -2107,9 +2285,19 @@ def transcribe(pcm_bytes):
 
 
 def _clean_llm_response(text):
-    """Strip meta-commentary that small LLMs append after the real answer."""
-    # Cut at lines that look like model self-commentary rather than answer content
-    meta_patterns = re.compile(
+    """Strip meta-commentary and leaked system-prompt instructions from LLM output."""
+    # Phrases that indicate the model is repeating its own instructions rather
+    # than answering. Any line containing these is dropped and scanning stops.
+    _INSTRUCTION_LEAK = re.compile(
+        r'do not use markdown|bullet points|spoken aloud|'
+        r'respond only with a json|single line.*nothing else|'
+        r'nothing else.*single line|keep answers concise|'
+        r'ideally under.*sentence|when the user (wants|asks)|'
+        r'brightness is 0.?100|state.*means on|id can be',
+        re.IGNORECASE
+    )
+    # Lines that signal the model is adding meta-commentary after its answer
+    _META_START = re.compile(
         r'^(This is a JSON|Here is|Note:|```|{'
         r'|\[{|"[a-z_]+"\s*:)',
         re.IGNORECASE
@@ -2117,7 +2305,8 @@ def _clean_llm_response(text):
     lines = text.split('\n')
     cleaned = []
     for line in lines:
-        if meta_patterns.match(line.strip()):
+        stripped = line.strip()
+        if _META_START.match(stripped) or _INSTRUCTION_LEAK.search(stripped):
             break
         cleaned.append(line)
     return '\n'.join(cleaned).strip() or text.strip()
@@ -2126,10 +2315,11 @@ def _clean_llm_response(text):
 def ask_llm(prompt):
     """Send prompt to AI, return response text."""
     try:
+        knowledge_context = retrieve_knowledge(prompt)
         resp = requests.post(f"{OLLAMA_URL}/api/generate", json={
             "model": OLLAMA_MODEL,
             "prompt": prompt,
-            "system": get_system_prompt(),
+            "system": get_system_prompt(knowledge_context=knowledge_context),
             "stream": False,
             "keep_alive": "30m",
             "options": {
@@ -2160,9 +2350,26 @@ def _strip_markdown(text):
 
 
 def speak(text):
-    """Text to speech via Piper, played through speaker."""
+    """Text to speech via Piper, played through speaker.
+
+    Uses the persistent in-process TTSEngine (streaming + on-disk cache) when
+    available; falls back to the piper CLI if the engine failed to load.
+    """
     text = _strip_markdown(text)
     print(f"  Speaking: {text[:100]}{'...' if len(text) > 100 else ''}")
+    if _tts_engine is not None and _tts_engine.available:
+        try:
+            elapsed = _tts_engine.speak(text)
+            tag = "cached" if _tts_engine.is_cached(text) else "live"
+            print(f"  Spoken ({tag}) in {elapsed:.2f}s")
+            return
+        except Exception as e:
+            print(f"  TTS engine error, falling back to CLI: {e}")
+    _speak_via_piper_cli(text)
+
+
+def _speak_via_piper_cli(text):
+    """Original piper-CLI path. Retained as a fallback only."""
     try:
         piper_proc = subprocess.Popen(
             ["piper", "--model", PIPER_MODEL, "--output-raw"],
@@ -2199,16 +2406,113 @@ try:
 except Exception as e:
     print(f"  AI warmup failed (will load on first query): {e}")
 
-print("Pre-warming Piper TTS...")
-try:
-    proc = subprocess.Popen(
-        ["piper", "--model", PIPER_MODEL, "--output-raw"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    proc.communicate(input=b"ready", timeout=15)
-    print("  Piper model loaded")
-except Exception as e:
-    print(f"  Piper warmup failed: {e}")
+def _canned_phrases_for_cache():
+    """Static strings the assistant may speak verbatim.
+
+    Cached at startup so the most common responses play back in ~100 ms with
+    no synthesis work at all. Variable phrases (names, numbers) populate the
+    cache lazily on first use instead.
+    """
+    phrases = [
+        # Generic fallbacks
+        "I didn't catch that.",
+        "Sorry, I didn't get a response.",
+        "Sorry, I'm not sure how to help with that.",
+        "Sorry, the language model is not running.",
+        "Sorry, the language model took too long to respond.",
+        "Sorry, I'm not connected to the device system right now.",
+        "No devices available.",
+        "I don't know which lights are available yet.",
+        "I don't know which relays are available yet.",
+
+        # All-devices confirmations (common enough to pre-render)
+        "Turning on all lights.",
+        "Turning off all lights.",
+        "Turning on all relays.",
+        "Turning off all relays.",
+
+        # Sensor "no data" responses
+        "I don't have water tank data right now.",
+        "I don't have fresh water data right now.",
+        "I don't have grey tank data right now.",
+        "I don't have black tank data right now.",
+        "I don't have level sensor data right now.",
+        "The trailer is level.",
+        "I don't have temperature data right now.",
+        "I don't have humidity data right now.",
+        "I don't have air quality data right now.",
+        "I don't have TVOC data right now.",
+        "I don't have CO2 data right now.",
+        "I don't have energy data right now.",
+        "I don't have location data right now.",
+        "I don't have time data right now.",
+        "I don't have date data right now.",
+        "I don't have elevation data right now.",
+        "I don't have heading data right now.",
+        "I don't have speed data right now.",
+        "I don't have satellite data right now.",
+        "Your current timezone doesn't observe daylight saving time.",
+        "I don't have location data to determine time zone changes.",
+
+        # Module identity responses (17 fixed descriptions from match_intent)
+        "Bearing is a GNSS module. It provides GPS positioning, heading, altitude, and precise timing over the CAN bus.",
+        "Borealis is an air quality sensor. It measures temperature, humidity, TVOC, and CO2. It is read-only and cannot control anything.",
+        "Plateau is a vehicle leveling sensor. It measures tilt on both axes and calculates how many inches each corner is off level.",
+        "Ampline is a battery shunt gateway. It measures voltage, current, power, and state of charge from a shunt on your battery bank.",
+        "Picket is a door and cabinet sensor module. It monitors open and closed states for up to several doors or compartments.",
+        "Tapper is an 8-button control panel. Pressing its buttons sends commands to control lights or relays on the CAN bus.",
+        "Torrent is an 8-channel PWM power distribution module. It controls vehicle lighting and accessories with on/off and brightness control.",
+        "Solstice is a solar MPPT charge controller gateway. It reads data from a Victron MPPT controller and publishes it to the CAN bus.",
+        "Aftline is a trailer wiring monitor. It detects the state of trailer connector pins to verify lighting and brake connections.",
+        "Therma is a closed-loop thermostat controller. It drives a relay to maintain a target temperature using a temperature sensor.",
+        "Switchback is an 8-channel relay module. It can switch higher-current loads on and off, such as appliances or accessory circuits.",
+        "Reservoir monitors water tank levels using ultrasonic sensors. It can track fresh, grey, and black water tanks.",
+        "Milepost is a hardwired 7-inch touchscreen display. It shows vehicle status and allows local control without needing a phone or app.",
+        "Fireside is a wireless 7-inch touchscreen display. It connects over WiFi and MQTT to show status and provide control.",
+        "Headwaters is the in-vehicle compute gateway. It runs on a Raspberry Pi CM5 and hosts the MQTT broker, tile server, CAN bridge, and Docker services.",
+        "Farwatch is the optional cloud platform. It is a self-hosted web app for remote monitoring and control when the vehicle has internet access.",
+        "Peregrine is the voice assistant you are talking to. It runs on a Radxa Dragon Q6A and uses a local LLM on the Hexagon NPU.",
+        "Spotter is a compact trailer monitor display. It shows towing alarms and offers remote control for the trailer being towed.",
+        "TrailCurrent is a 100% open source Software Defined Vehicle platform. It is community-developed and provides a complete system for vehicle monitoring, control, and autonomous decision-making.",
+    ]
+    # Also pre-render per-device confirmations using the currently-known names,
+    # so first-use is instant for any device the registry already has.
+    for did, name in sorted(_device_names_by_id.items()):
+        phrases.append(f"Turning on {name}.")
+        phrases.append(f"Turning off {name}.")
+        phrases.append(f"Turning on the {name}.")
+        phrases.append(f"Turning off the {name}.")
+    return phrases
+
+
+print("Loading Piper TTS engine...")
+_tts_engine = None
+if TTS_USE_ENGINE:
+    try:
+        _tts_engine = TTSEngine(
+            model_path=PIPER_MODEL,
+            cache_dir=TTS_CACHE_DIR,
+            playback_device=_alsa_playback_device,
+        )
+        if not _tts_engine.load():
+            print("  TTSEngine load returned False; CLI fallback will be used")
+            _tts_engine = None
+    except Exception as e:
+        print(f"  TTSEngine init failed ({e}); CLI fallback will be used")
+        _tts_engine = None
+if _tts_engine is not None:
+    _tts_engine.warm_cache(_canned_phrases_for_cache(), background=True)
+else:
+    # Old CLI path — warm at least the OS page cache for the model file
+    try:
+        proc = subprocess.Popen(
+            ["piper", "--model", PIPER_MODEL, "--output-raw"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        proc.communicate(input=b"ready", timeout=15)
+        print("  Piper CLI warmup complete")
+    except Exception as e:
+        print(f"  Piper CLI warmup failed: {e}")
 
 # --- Main loop ---
 print("=== Voice Assistant Ready ===\n")
@@ -2227,7 +2531,8 @@ while True:
         _drain_audio_buffer()  # discard audio that buffered during beep
 
         pcm = record_speech()
-        play_beep(BEEP_DONE_WAV)
+        # Kick off the "got it" beep without blocking — it plays over STT.
+        play_beep_async(BEEP_DONE_WAV)
 
         user_text = transcribe(pcm)
         print(f"  You said: \"{user_text}\"")
