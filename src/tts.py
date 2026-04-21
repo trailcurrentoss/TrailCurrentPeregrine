@@ -207,6 +207,89 @@ class TTSEngine:
             self._stream_and_cache(text, path)
         return time.monotonic() - t0
 
+    def speak_stream(
+        self,
+        sentences: Iterable[str],
+        cache_text: Optional[str] = None,
+    ) -> float:
+        """Speak a stream of text chunks through one continuous aplay process.
+
+        Each item in ``sentences`` is synthesized and piped to aplay as soon
+        as it arrives, so audio playback can begin while later sentences are
+        still being produced upstream (e.g. by an LLM token stream).
+
+        If ``cache_text`` is set and caching is enabled, the full PCM is
+        collected and written as a single WAV keyed by that text, so an
+        identical future request will play back from disk in ~100 ms.
+
+        Returns wall-clock seconds elapsed. Raises RuntimeError if no Piper
+        voice is available.
+        """
+        t0 = time.monotonic()
+        if not self.load():
+            raise RuntimeError("PiperVoice unavailable")
+        with self._lock:
+            proc = subprocess.Popen(
+                self._aplay_raw_cmd(),
+                stdin=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            collected = bytearray() if cache_text else None
+            first_sr = None
+            broken = False
+            try:
+                for sentence in sentences:
+                    if broken:
+                        # aplay died — drain the producer but skip synthesis.
+                        continue
+                    s = sentence.strip() if sentence else ""
+                    if not s:
+                        continue
+                    for chunk in self._voice.synthesize(s):
+                        pcm = chunk.audio_int16_bytes
+                        if not pcm:
+                            continue
+                        if first_sr is None:
+                            first_sr = chunk.sample_rate
+                        try:
+                            proc.stdin.write(pcm)
+                        except (BrokenPipeError, OSError):
+                            broken = True
+                            collected = None
+                            break
+                        if collected is not None:
+                            collected.extend(pcm)
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            if cache_text and collected and first_sr:
+                cache_path = self._cache_path(cache_text)
+                if cache_path is not None and not cache_path.exists():
+                    tmp = cache_path.with_suffix(".wav.tmp")
+                    try:
+                        with wave.open(str(tmp), "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(self._sample_width)
+                            wf.setframerate(first_sr)
+                            wf.writeframes(bytes(collected))
+                        tmp.replace(cache_path)
+                    except Exception as e:
+                        print(f"  [tts] cache write failed: {e}")
+                        try:
+                            tmp.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except Exception:
+                            pass
+        return time.monotonic() - t0
+
     def _stream_and_cache(self, text: str, cache_path: Optional[Path]) -> None:
         proc = subprocess.Popen(
             self._aplay_raw_cmd(),

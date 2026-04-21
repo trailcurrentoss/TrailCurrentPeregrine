@@ -60,14 +60,6 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 MQTT_CA_CERT = os.getenv("MQTT_CA_CERT", "")  # path to ca.pem for self-signed certs
 MQTT_USE_TLS = os.getenv("MQTT_USE_TLS", "true").lower() in ("true", "1", "yes")
 
-# Knowledge base config
-KNOWLEDGE_BASE_PATH = os.getenv("KNOWLEDGE_BASE_PATH",
-    os.path.expanduser("~/knowledge/chunks.json"))
-
-_kb_chunks: list = []
-_kb_vectorizer = None   # TfidfVectorizer fitted at startup
-_kb_matrix = None       # sparse CSR matrix: n_chunks × vocab
-
 BASE_SYSTEM_PROMPT = (
     "You are Peregrine, voice assistant for TrailCurrent, a 100% open source Software Defined Vehicle platform "
     "(community-developed; Waveshare/Espressif supply hardware only). "
@@ -115,76 +107,6 @@ print("Loading Whisper STT model...")
 _CPU_THREADS = int(os.getenv("CPU_THREADS", "8"))
 whisper_model = WhisperModel(WHISPER_SIZE, device="cpu", compute_type="int8",
                              cpu_threads=_CPU_THREADS)
-
-print("Loading knowledge base...")
-def _load_knowledge_base():
-    """Load chunks.json and fit a TF-IDF index for offline documentation retrieval."""
-    global _kb_chunks, _kb_vectorizer, _kb_matrix
-    if not os.path.isfile(KNOWLEDGE_BASE_PATH):
-        print(f"  Knowledge base not found at {KNOWLEDGE_BASE_PATH} — skipping")
-        return
-    try:
-        import json as _json
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        t0 = time.monotonic()
-        with open(KNOWLEDGE_BASE_PATH, encoding="utf-8") as f:
-            _kb_chunks = _json.load(f)
-        texts = [c["text"] for c in _kb_chunks]
-        _kb_vectorizer = TfidfVectorizer(max_features=8000, ngram_range=(1, 2))
-        _kb_matrix = _kb_vectorizer.fit_transform(texts)
-        elapsed = time.monotonic() - t0
-        print(f"  Knowledge base loaded: {len(_kb_chunks)} chunks ({elapsed:.1f}s)")
-    except Exception as e:
-        print(f"  Knowledge base load failed: {e}")
-
-_load_knowledge_base()
-
-
-# TrailCurrent module names — used to boost retrieval when query names a module
-_TC_MODULES = {
-    "bearing", "borealis", "plateau", "ampline", "picket", "tapper",
-    "torrent", "solstice", "aftline", "therma", "switchback", "reservoir",
-    "milepost", "fireside", "headwaters", "farwatch", "peregrine", "spotter",
-}
-_MODULE_BOOST = 0.15  # added to TF-IDF score when chunk source/text mentions the queried module
-
-
-def retrieve_knowledge(query: str, top_k: int = 2, min_score: float = 0.10) -> list:
-    """Return up to top_k documentation chunk texts relevant to query.
-
-    Uses TF-IDF cosine similarity with a module-name boost: if the query
-    names a known TrailCurrent module, chunks whose source or text mention
-    that module receive a score bonus. This compensates for TF-IDF's poor
-    handling of short "what is X" queries where X is the only signal.
-    Returns an empty list if the knowledge base is not loaded or no chunk
-    meets min_score, so callers can treat it as optional context.
-    """
-    if _kb_vectorizer is None or _kb_matrix is None or not _kb_chunks:
-        return []
-    try:
-        from sklearn.metrics.pairwise import cosine_similarity
-        import numpy as np
-        q_vec = _kb_vectorizer.transform([query])
-        scores = cosine_similarity(q_vec, _kb_matrix)[0].copy()
-
-        # Boost chunks that mention the same module(s) named in the query
-        q_lower = query.lower()
-        for module in _TC_MODULES:
-            if module in q_lower:
-                for i, chunk in enumerate(_kb_chunks):
-                    chunk_text = (chunk.get("source", "") + " " + chunk.get("text", "")).lower()
-                    if module in chunk_text:
-                        scores[i] += _MODULE_BOOST
-
-        top_indices = np.argsort(scores)[::-1][:top_k]
-        return [
-            _kb_chunks[i]["text"]
-            for i in top_indices
-            if scores[i] >= min_score
-        ]
-    except Exception:
-        return []
-
 
 # --- Audio I/O via arecord / aplay (replaces PyAudio) ---
 
@@ -753,32 +675,16 @@ def get_sensor_summary():
     return "Current sensor readings:\n" + "\n".join(lines)
 
 
-def get_system_prompt(knowledge_context=None):
-    """Build the full system prompt with current sensor data.
-
-    knowledge_context: optional list of documentation chunk strings retrieved
-    from the knowledge base. Injected between the base prompt and sensor data
-    so the LLM can answer questions about the TrailCurrent system offline.
-    """
+def get_system_prompt():
+    """Build the full system prompt with current sensor data and device registry."""
     if not MQTT_BROKER:
-        base = (
+        return (
             "You are a helpful voice assistant. Keep answers concise and conversational, "
             "ideally under 3 sentences. Do not use markdown, bullet points, or formatting "
             "since your response will be spoken aloud."
         )
-        if knowledge_context:
-            base += "\n\nUse the following TrailCurrent documentation to answer the question. Base your answer on this, not on assumptions:\n"
-            base += "\n---\n".join(knowledge_context)
-            base += "\n"
-        return base
 
     prompt = BASE_SYSTEM_PROMPT
-
-    if knowledge_context:
-        prompt += "Use the following TrailCurrent documentation to answer the question. Base your answer on this, not on assumptions:\n"
-        prompt += "\n---\n".join(knowledge_context)
-        prompt += "\n\n"
-
     prompt += get_sensor_summary()
 
     # Append device registry so the LLM knows device names and types
@@ -2284,42 +2190,75 @@ def transcribe(pcm_bytes):
         return " ".join(seg.text for seg in segments).strip()
 
 
+# Phrases that indicate the model is repeating its own instructions or
+# regurgitating the injected reference documentation rather than answering.
+# Any sentence matching these is dropped.
+_INSTRUCTION_LEAK_RE = re.compile(
+    # System-prompt echoes
+    r'do not use markdown|bullet points|spoken aloud|'
+    r'respond only with a json|single line.*nothing else|'
+    r'nothing else.*single line|keep answers concise|'
+    r'ideally under.*sentence|when the user (wants|asks)|'
+    r'brightness is 0.?100|state.*means on|id can be|'
+    r'use the following|base your answer|not (on )?assumptions|'
+    # BASE_SYSTEM_PROMPT echoes
+    r'give short|plain[- ]?speech|plain[- ]?spoken|short plain|'
+    r'device control|output only|no other text|'
+    r'other instructions|these instructions|the instructions|following instructions|'
+    r'\b0\s?=\s?off\b|\b1\s?=\s?on\b|'
+    r'"?action"?\s*[:=]|"?state"?\s*[:=]|"?brightness"?\s*[:=]|'
+    r'\{\s*"action"|\{"[a-z_]+"\s*:|'
+    # Raw-documentation echoes (a voice answer should never contain these)
+    r'signed (byte|integer|16)|unsigned (byte|integer|16)|'
+    r'big-endian|little-endian|'
+    r'\bbyte\s?\d|\bbit\s?\d|'
+    r'state\s?\d\s?(equals|=|means)|equals\s?\d|'
+    r'\b0x[0-9a-f]{2,}|'
+    r'can (id|bus|payload|frame|message)|'
+    r'\b(mqtt|twai|uart|mdns|nvs|pwm|ota|esp32|ve\.direct)\b',
+    re.IGNORECASE
+)
+# Lines that signal the model is adding meta-commentary after its answer.
+_META_START_RE = re.compile(
+    r'^(This is a JSON|Here is|Note:|```|{'
+    r'|\[{|"[a-z_]+"\s*:)',
+    re.IGNORECASE
+)
+# Sentence boundary: terminal punctuation, optional closing quote/bracket,
+# then whitespace. Used to cut a token stream into speakable chunks.
+_SENTENCE_END_RE = re.compile(r'[.!?][")\]\'}]*\s+')
+# If a stream buffer grows past this many chars with no terminal punctuation,
+# cut at the last comma instead so TTS can start on long opening clauses.
+_STREAM_FLUSH_CHARS = 120
+
+
+def _is_leak_or_meta(text):
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if _META_START_RE.match(stripped) or _INSTRUCTION_LEAK_RE.search(stripped):
+            return True
+    return False
+
+
 def _clean_llm_response(text):
     """Strip meta-commentary and leaked system-prompt instructions from LLM output."""
-    # Phrases that indicate the model is repeating its own instructions rather
-    # than answering. Any line containing these is dropped and scanning stops.
-    _INSTRUCTION_LEAK = re.compile(
-        r'do not use markdown|bullet points|spoken aloud|'
-        r'respond only with a json|single line.*nothing else|'
-        r'nothing else.*single line|keep answers concise|'
-        r'ideally under.*sentence|when the user (wants|asks)|'
-        r'brightness is 0.?100|state.*means on|id can be',
-        re.IGNORECASE
-    )
-    # Lines that signal the model is adding meta-commentary after its answer
-    _META_START = re.compile(
-        r'^(This is a JSON|Here is|Note:|```|{'
-        r'|\[{|"[a-z_]+"\s*:)',
-        re.IGNORECASE
-    )
     lines = text.split('\n')
     cleaned = []
     for line in lines:
         stripped = line.strip()
-        if _META_START.match(stripped) or _INSTRUCTION_LEAK.search(stripped):
+        if _META_START_RE.match(stripped) or _INSTRUCTION_LEAK_RE.search(stripped):
             break
         cleaned.append(line)
     return '\n'.join(cleaned).strip() or text.strip()
 
 
 def ask_llm(prompt):
-    """Send prompt to AI, return response text."""
+    """Send prompt to AI, return response text (non-streaming)."""
     try:
-        knowledge_context = retrieve_knowledge(prompt)
         resp = requests.post(f"{OLLAMA_URL}/api/generate", json={
             "model": OLLAMA_MODEL,
             "prompt": prompt,
-            "system": get_system_prompt(knowledge_context=knowledge_context),
+            "system": get_system_prompt(),
             "stream": False,
             "keep_alive": "30m",
             "options": {
@@ -2334,6 +2273,79 @@ def ask_llm(prompt):
         return "Sorry, the language model is not running."
     except requests.exceptions.Timeout:
         return "Sorry, the language model took too long to respond."
+
+
+def ask_llm_stream(prompt):
+    """Stream LLM response, yielding completed sentences as they arrive.
+
+    Tokens are buffered until a sentence boundary is hit, then the full
+    sentence (including its terminal punctuation) is yielded. The trailing
+    partial buffer at end-of-stream is flushed as a final yield.
+
+    A response that begins with ``{`` is treated as a JSON command by the
+    caller; in that case the sentence detector still works (or simply yields
+    the whole blob as the final remainder), and the caller can accumulate
+    everything before invoking handle_command.
+    """
+    resp = None
+    try:
+        resp = requests.post(f"{OLLAMA_URL}/api/generate", json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "system": get_system_prompt(),
+            "stream": True,
+            "keep_alive": "30m",
+            "options": {
+                "num_predict": 200,
+                "num_thread": _CPU_THREADS,
+            }
+        }, timeout=60, stream=True)
+        resp.raise_for_status()
+        buffer = ""
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            token = obj.get("response", "")
+            if token:
+                buffer += token
+                while True:
+                    m = _SENTENCE_END_RE.search(buffer)
+                    if m:
+                        sentence = buffer[:m.end()]
+                        buffer = buffer[m.end():]
+                    elif len(buffer) >= _STREAM_FLUSH_CHARS:
+                        # No terminal punctuation yet but the buffer is long
+                        # enough that waiting hurts perceived latency. Flush at
+                        # the last comma so speech starts on a natural pause.
+                        cut = buffer.rfind(", ")
+                        if cut == -1:
+                            break
+                        sentence = buffer[:cut + 1]
+                        buffer = buffer[cut + 2:]
+                    else:
+                        break
+                    if _is_leak_or_meta(sentence):
+                        return
+                    yield sentence
+            if obj.get("done"):
+                break
+        remainder = buffer.strip()
+        if remainder and not _is_leak_or_meta(remainder):
+            yield remainder
+    except requests.exceptions.ConnectionError:
+        yield "Sorry, the language model is not running."
+    except requests.exceptions.Timeout:
+        yield "Sorry, the language model took too long to respond."
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
 
 def _strip_markdown(text):
@@ -2366,6 +2378,45 @@ def speak(text):
         except Exception as e:
             print(f"  TTS engine error, falling back to CLI: {e}")
     _speak_via_piper_cli(text)
+
+
+def speak_stream_sentences(sentences):
+    """Speak an iterator of sentences with continuous playback.
+
+    Strips markdown per-sentence before synthesis. Falls back to buffering
+    the whole stream and calling the CLI path if no in-process engine is
+    available. Returns the joined full text that was spoken.
+    """
+    collected = []
+
+    def _feed():
+        for s in sentences:
+            if not s:
+                continue
+            collected.append(s)
+            cleaned = _strip_markdown(s)
+            if cleaned:
+                yield cleaned
+
+    if _tts_engine is not None and _tts_engine.available:
+        t0 = time.monotonic()
+        try:
+            _tts_engine.speak_stream(_feed())
+            elapsed = time.monotonic() - t0
+            full = "".join(collected).strip()
+            preview = full[:100] + ("..." if len(full) > 100 else "")
+            print(f"  Spoken (streamed) in {elapsed:.2f}s: \"{preview}\"")
+            return full
+        except Exception as e:
+            print(f"  Streaming TTS engine error, falling back to CLI: {e}")
+    # Engine unavailable or failed mid-stream: buffer remaining and speak once.
+    for s in sentences:
+        if s:
+            collected.append(s)
+    full = "".join(collected).strip()
+    if full:
+        speak(full)
+    return full
 
 
 def _speak_via_piper_cli(text):
@@ -2547,19 +2598,32 @@ while True:
         if response:
             speak(response)
         else:
-            # Fall back to LLM for general questions
+            # Fall back to LLM for general questions — stream sentences to TTS
+            # so playback starts as soon as the first sentence is generated,
+            # rather than waiting for the full reply.
             print("  Asking LLM...")
-            reply = ask_llm(user_text)
-            print(f"  Reply: \"{reply[:100]}{'...' if len(reply) > 100 else ''}\"")
-            confirmation = handle_command(reply)
-            if confirmation:
-                speak(confirmation)
-            elif reply.strip().startswith("{"):
-                # LLM returned unrecognized JSON — don't speak it
-                print("  (LLM returned unrecognized JSON, ignoring)")
-                speak("Sorry, I'm not sure how to help with that.")
+            chunks_iter = ask_llm_stream(user_text)
+            first = next(chunks_iter, None)
+            if first is None:
+                speak("Sorry, I didn't get a response.")
+            elif first.lstrip().startswith("{"):
+                # JSON command path — accumulate fully before deciding.
+                full = first + "".join(chunks_iter)
+                print(f"  Reply: \"{full[:100]}{'...' if len(full) > 100 else ''}\"")
+                confirmation = handle_command(full)
+                if confirmation:
+                    speak(confirmation)
+                else:
+                    print("  (LLM returned unrecognized JSON, ignoring)")
+                    speak("Sorry, I'm not sure how to help with that.")
             else:
-                speak(reply)
+                # Prose response — stream into TTS.
+                print(f"  Reply: \"{first.strip()[:100]}{'...' if len(first) > 100 else ''}\"")
+                def _chained():
+                    yield first
+                    for s in chunks_iter:
+                        yield s
+                speak_stream_sentences(_chained())
 
         ignore_after_speak = 5  # ignore wake detections for 5s after speaking
         wake_model.reset()

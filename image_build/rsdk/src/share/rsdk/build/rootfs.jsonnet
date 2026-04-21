@@ -267,7 +267,6 @@ function(
                     "paho-mqtt==2.1.0" \
                     "numpy==2.4.4" \
                     "scipy==1.17.1" \
-                    "scikit-learn==1.8.0" \
                     "pathvalidate==3.3.1" \
                     "requests==2.33.1" \
                     "timezonefinder==8.2.2"
@@ -294,7 +293,7 @@ function(
                 echo "[hook 10] CHECKPOINT — venv smoke test"
                 chroot "$1" /home/trailcurrent/assistant-env/bin/python3 -c 'from openwakeword.model import Model; m = Model(); del m; print("  openwakeword OK")'
                 chroot "$1" /home/trailcurrent/assistant-env/bin/python3 -c 'from faster_whisper import WhisperModel; print("  faster_whisper import OK")'
-                chroot "$1" /home/trailcurrent/assistant-env/bin/python3 -c 'import paho.mqtt.client, numpy, scipy, sklearn, timezonefinder; print("  all dependencies importable")'
+                chroot "$1" /home/trailcurrent/assistant-env/bin/python3 -c 'import paho.mqtt.client, numpy, scipy, timezonefinder; print("  all dependencies importable")'
                 echo "  venv smoke test passed"
             |||,
 
@@ -308,11 +307,6 @@ function(
                 install -m 644 "$STAGING/src/assistant.py" "$1/home/trailcurrent/assistant.py"
                 install -m 644 "$STAGING/src/tts.py"       "$1/home/trailcurrent/tts.py"
                 install -m 644 "$STAGING/src/genie_server.py" "$1/home/trailcurrent/genie_server.py"
-                # Benchmarking / CPU-unlock helper (bench only)
-                if [ -f "$STAGING/files/scripts/peregrine-unleash.sh" ]; then
-                    install -m 755 "$STAGING/files/scripts/peregrine-unleash.sh" \
-                        "$1/usr/local/sbin/peregrine-unleash"
-                fi
                 # On-disk Piper TTS cache dir (populated on first run)
                 install -d -o trailcurrent -g trailcurrent -m 755 \
                     "$1/home/trailcurrent/.cache/peregrine-tts"

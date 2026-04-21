@@ -1,10 +1,25 @@
 [Unit]
-Description=Set CPU governor to performance
+Description=CPU policy: schedutil governor, raise scaling_max_freq ceiling, enable boost
 After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > "$g"; done'
+# schedutil scales freq with load — full max under work, drops to idle min otherwise.
+# Pinning to 'performance' kept every core at max_freq even at idle and ran the
+# chip at ~90 C. Keep the ceiling raised (so big cores aren't artificially capped
+# by the default scaling_max_freq) and let the scheduler drop freq when idle.
+ExecStart=/bin/bash -c '\
+  for cf in /sys/devices/system/cpu/cpu*/cpufreq; do \
+    [ -d "$cf" ] || continue; \
+    [ -w "$cf/scaling_governor" ] && echo schedutil > "$cf/scaling_governor" 2>/dev/null || true; \
+    if [ -r "$cf/cpuinfo_max_freq" ] && [ -w "$cf/scaling_max_freq" ]; then \
+      cat "$cf/cpuinfo_max_freq" > "$cf/scaling_max_freq" 2>/dev/null || true; \
+    fi; \
+  done; \
+  if [ -w /sys/devices/system/cpu/cpufreq/boost ]; then \
+    echo 1 > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || true; \
+  fi; \
+  true'
 RemainAfterExit=yes
 
 [Install]

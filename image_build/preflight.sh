@@ -248,6 +248,41 @@ download_npu_model() {
     fi
 }
 
+# Patch the upstream NPU config so QNN doesn't busy-poll 3 cores at idle.
+# Upstream ships poll=true (lowest per-token latency) and perf_profile=burst
+# (NPU always at max clock). On QCS6490 that caused cpu5/6/7 to sit at ~90%
+# with the package hitting ~90 C even when no query was running.
+# poll=false and perf_profile=balanced drop idle CPU load to ~0% and idle
+# package temps to ~62 C with no measurable latency hit on small queries.
+# Idempotent — safe to run every preflight check.
+patch_npu_model_config() {
+    local cfg="$NPU_CACHE/htp-model-config-llama32-1b-gqa.json"
+    local ext="$NPU_CACHE/htp_backend_ext_config.json"
+    [ -f "$cfg" ] || return 0
+    [ -f "$ext" ] || return 0
+    python3 - "$cfg" "$ext" <<'PYEOF' || { fail "NPU config patch failed"; return 1; }
+import json, sys
+cfg_path, ext_path = sys.argv[1], sys.argv[2]
+changed = False
+with open(cfg_path) as f: cfg = json.load(f)
+qnn = cfg.get("dialog", {}).get("engine", {}).get("backend", {}).get("QnnHtp", {})
+if qnn.get("poll") is not False:
+    qnn["poll"] = False; changed = True
+with open(ext_path) as f: ext = json.load(f)
+for dev in ext.get("devices", []):
+    for core in dev.get("cores", []):
+        if core.get("perf_profile") != "balanced":
+            core["perf_profile"] = "balanced"; changed = True
+if changed:
+    with open(cfg_path, "w") as f: json.dump(cfg, f, indent=4)
+    with open(ext_path, "w") as f: json.dump(ext, f, indent=4)
+    print("PATCHED")
+else:
+    print("ALREADY_PATCHED")
+PYEOF
+    ok "NPU config patched (poll=false, perf_profile=balanced)"
+}
+
 # 8a. NPU model
 if $FORCE_CACHE; then
     warn "force-cache: removing NPU model cache for re-download"
@@ -272,6 +307,7 @@ if [ -f "${NPU_CACHE}/genie-t2t-run" ]; then
             verify_hashes "NPU model" "${NPU_EXPECTED_HASHES[@]}" || true
         fi
     fi
+    patch_npu_model_config
 fi
 
 # 8b. Piper voice

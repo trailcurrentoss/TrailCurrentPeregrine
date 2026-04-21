@@ -78,31 +78,16 @@ if [ -f "${SCRIPT_DIR}/models/hey_peregrine.onnx.data" ]; then
 fi
 
 # ── 5. Service files ────────────────────────────────────────────────────────
-echo "[5/6] Copying service files..."
+echo "[5/5] Copying service files..."
 $SCP "${SCRIPT_DIR}/config/voice-assistant.service" "${TARGET}:/tmp/voice-assistant.service"
 $SCP "${SCRIPT_DIR}/config/genie-server.service"   "${TARGET}:/tmp/genie-server.service"
+$SCP "${SCRIPT_DIR}/image_build/files/systemd/cpu-performance.service" \
+     "${TARGET}:/tmp/cpu-performance.service"
 $SSHT "$TARGET" "sudo install -m 644 /tmp/voice-assistant.service /etc/systemd/system/voice-assistant.service && \
                  sudo install -m 644 /tmp/genie-server.service   /etc/systemd/system/genie-server.service && \
-                 rm -f /tmp/voice-assistant.service /tmp/genie-server.service && \
+                 sudo install -m 644 /tmp/cpu-performance.service /etc/systemd/system/cpu-performance.service && \
+                 rm -f /tmp/voice-assistant.service /tmp/genie-server.service /tmp/cpu-performance.service && \
                  sudo systemctl daemon-reload"
-
-# ── 6. Knowledge base ────────────────────────────────────────────────────────
-echo "[6/7] Copying knowledge base..."
-if [ -f "${SCRIPT_DIR}/knowledge/chunks.json" ]; then
-    $SSH "$TARGET" "mkdir -p ${REMOTE_HOME}/knowledge"
-    $SCP "${SCRIPT_DIR}/knowledge/chunks.json" "${TARGET}:${REMOTE_HOME}/knowledge/chunks.json"
-else
-    echo "  WARNING: knowledge/chunks.json not found — run: python knowledge/build_knowledge_base.py"
-fi
-
-# ── 7. Unleash / benchmarking helper ────────────────────────────────────────
-echo "[7/7] Copying peregrine-unleash.sh..."
-if [ -f "${SCRIPT_DIR}/image_build/files/scripts/peregrine-unleash.sh" ]; then
-    $SCP "${SCRIPT_DIR}/image_build/files/scripts/peregrine-unleash.sh" \
-        "${TARGET}:/tmp/peregrine-unleash.sh"
-    $SSHT "$TARGET" "sudo install -m 755 /tmp/peregrine-unleash.sh /usr/local/sbin/peregrine-unleash && \
-                     rm -f /tmp/peregrine-unleash.sh"
-fi
 
 echo ""
 echo "Deploy complete. Files copied:"
@@ -112,8 +97,7 @@ echo "  ${REMOTE_HOME}/genie_server.py"
 echo "  ${REMOTE_HOME}/models/hey_peregrine.onnx"
 echo "  /etc/systemd/system/voice-assistant.service"
 echo "  /etc/systemd/system/genie-server.service"
-echo "  ${REMOTE_HOME}/knowledge/chunks.json"
-echo "  /usr/local/sbin/peregrine-unleash"
+echo "  /etc/systemd/system/cpu-performance.service"
 echo ""
 echo "To restart the assistant:"
 echo "  ssh -t ${TARGET} sudo systemctl restart voice-assistant"

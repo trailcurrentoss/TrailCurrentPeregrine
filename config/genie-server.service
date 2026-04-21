@@ -15,6 +15,8 @@ RestartSec=5
 Environment=HOME=/home/trailcurrent
 Environment=PYTHONUNBUFFERED=1
 Environment=GENIE_DIR=/home/trailcurrent/Llama3.2-1B-1024-v68
+# libGenie.so dlopens libQnnHtp.so, libQnnHtpV68Stub.so, etc. from $GENIE_DIR
+Environment=LD_LIBRARY_PATH=/home/trailcurrent/Llama3.2-1B-1024-v68
 
 # IMPORTANT: do NOT add ProtectSystem / ProtectHome / etc. here.
 # Hardening breaks /dev/fastrpc-* device access required by genie-t2t-run.
