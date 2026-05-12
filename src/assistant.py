@@ -66,7 +66,30 @@ BASE_SYSTEM_PROMPT = (
     "Give short plain-speech answers. "
     "Device control: output only {\"action\":\"light\",\"id\":\"all\",\"state\":1} "
     "or {\"action\":\"light\",\"id\":\"1\",\"brightness\":50} — no other text. "
-    "id is \"all\" or a number; state 1=on 0=off; brightness 0-100 for individual lights only.\n\n"
+    "id is \"all\" or a number; state 1=on 0=off; brightness 0-100 for individual lights only.\n"
+    "Playbill radio: output only "
+    "{\"action\":\"playbill.tune\",\"playbill\":\"<name>\",\"band\":\"fm\",\"frequency\":97.5} "
+    "— no other text. Pass the frequency as the raw number the user spoke. "
+    "For \"fm\" it is a decimal between 87.5 and 108 (e.g. 97.5, 101.1, 88.9). "
+    "For \"am\" it is a whole number between 530 and 1700 (e.g. 1010, 740, 880). "
+    "Never round, snap, convert units, or guess — copy the spoken number verbatim. "
+    "Always target exactly one Playbill. If the user omits the name and only "
+    "one Playbill is known, omit the field; otherwise use the spoken name. "
+    "Never use \"all\" — Peregrine cannot control multiple Playbills at once.\n"
+    "Playbill band switch (no station named): output only "
+    "{\"action\":\"playbill.switchBand\",\"playbill\":\"<name>\",\"band\":\"fm\"} "
+    "or {\"action\":\"playbill.switchBand\",\"playbill\":\"<name>\",\"band\":\"am\"} "
+    "— no other text. Use this ONLY when the user wants to change bands but "
+    "does NOT name a frequency (e.g. \"switch to FM\", \"play AM radio\"). "
+    "It resumes the last station played on that band. If the user names a "
+    "frequency, use playbill.tune instead.\n"
+    "Playbill volume: output only one of "
+    "{\"action\":\"playbill.volumeUp\",\"playbill\":\"<name>\"} "
+    "{\"action\":\"playbill.volumeDown\",\"playbill\":\"<name>\"} "
+    "{\"action\":\"playbill.volumeSet\",\"playbill\":\"<name>\",\"percent\":50} "
+    "— no other text. Use volumeUp/volumeDown for relative changes (5% step); "
+    "use volumeSet only when the user names a specific percent. Same Playbill-name "
+    "rules as tune.\n\n"
 )
 
 # --- Init ---
@@ -407,6 +430,87 @@ def _rebuild_device_registry():
 _pdm_entries = {}    # {1: {"id": 1, "type": "light", "name": "Living Room"}, ...}
 _relay_entries = {}  # {101: {"id": 101, "type": "relay", "name": "Water Pump"}, ...}
 
+# Playbill registry: populated from retained `local/playbill/<slug>/system/status`.
+# Headwaters consumes the same topic to maintain its own list (see Headwaters
+# containers/backend/src/mqtt.js handlePlaybillStatus). If a normalized
+# `local/config/playbill_devices` topic is added later, swap the subscription.
+_playbill_devices = {}     # slug -> {"slug": slug, "name": "Living Room", "online": True}
+_playbill_by_name = {}     # "living room" -> slug
+_playbill_word_phonetics = {}  # metaphone_code -> set of original words
+_playbill_words = set()
+
+
+def _rebuild_playbill_index():
+    """Rebuild the Playbill name lookup + phonetic index from current presence."""
+    _playbill_by_name.clear()
+    _playbill_word_phonetics.clear()
+    _playbill_words.clear()
+    for slug, info in _playbill_devices.items():
+        name = info.get("name") or slug
+        _playbill_by_name[name.strip().lower()] = slug
+        for w in name.lower().split():
+            _playbill_words.add(w)
+            code = _metaphone(w) if "_metaphone" in globals() else ""
+            if code:
+                _playbill_word_phonetics.setdefault(code, set()).add(w)
+
+
+_PLAYBILL_FREQ_CACHE_PATH = os.path.expanduser("~/playbill_last_freq.json")
+# {slug: {"fm": hz, "am": hz}} — last running freq observed per Playbill per band.
+# Persisted so "switch to FM/AM" still works across Peregrine restarts.
+_playbill_last_freq = {}
+
+
+def _load_playbill_freq_cache():
+    global _playbill_last_freq
+    try:
+        with open(_PLAYBILL_FREQ_CACHE_PATH, "r") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                _playbill_last_freq = data
+    except (OSError, json.JSONDecodeError):
+        _playbill_last_freq = {}
+
+
+def _save_playbill_freq_cache():
+    try:
+        with open(_PLAYBILL_FREQ_CACHE_PATH, "w") as f:
+            json.dump(_playbill_last_freq, f)
+    except OSError as e:
+        print(f"  Warning: could not save playbill freq cache: {e}")
+
+
+def _record_playbill_tune(slug, band, freq_hz):
+    """Remember the last running frequency for a Playbill on a given band."""
+    if band not in ("fm", "am") or not slug:
+        return
+    bands = _playbill_last_freq.setdefault(slug, {})
+    if bands.get(band) == freq_hz:
+        return
+    bands[band] = freq_hz
+    _save_playbill_freq_cache()
+
+
+_load_playbill_freq_cache()
+
+
+def _update_playbill_presence(slug, payload):
+    """Apply a retained presence payload for one Playbill. Empty payload = forget."""
+    if not slug:
+        return
+    if not payload:
+        _playbill_devices.pop(slug, None)
+    else:
+        name = payload.get("name") or slug
+        online = bool(payload.get("online", True))
+        _playbill_devices[slug] = {"slug": slug, "name": name, "online": online}
+    _rebuild_playbill_index()
+    online_count = sum(1 for d in _playbill_devices.values() if d["online"])
+    print(f"  Playbill registry: {len(_playbill_devices)} known, {online_count} online")
+    for s, info in _playbill_devices.items():
+        marker = "" if info["online"] else " (offline)"
+        print(f"    [{s}] {info['name']}{marker}")
+
 
 def _update_device_registry(channels, save=True):
     """Rebuild the PDM portion of the device registry."""
@@ -502,6 +606,9 @@ def _connect_mqtt():
             client.subscribe("local/water/status")
             client.subscribe("local/config/pdm_channels")
             client.subscribe("local/config/relay_channels")
+            client.subscribe("local/playbill/+/system/status")
+            client.subscribe("local/playbill/+/radio/status")
+            client.subscribe("local/playbill/+/volume/status")
             # Request current config from Headwaters (in case retained topics are stale/absent)
             client.publish("local/config/request", json.dumps({"source": "peregrine"}), qos=1)
             _mqtt_connected.set()
@@ -528,6 +635,22 @@ def _connect_mqtt():
             elif msg.topic == "local/config/relay_channels":
                 channels = payload.get("channels", [])
                 _update_relay_registry(channels)
+            # Playbill presence — name + online state come from the retained
+            # `local/playbill/<slug>/system/status` topic published by each
+            # Playbill controller (see TrailCurrentPlaybill controller/src/index.js).
+            elif msg.topic.startswith("local/playbill/") and msg.topic.endswith("/system/status"):
+                parts = msg.topic.split("/")
+                if len(parts) == 5:
+                    _update_playbill_presence(parts[2], payload)
+            # Track each Playbill's last running station per band so
+            # "switch to FM/AM" with no explicit frequency can resume it.
+            elif msg.topic.startswith("local/playbill/") and msg.topic.endswith("/radio/status"):
+                parts = msg.topic.split("/")
+                if len(parts) == 5 and isinstance(payload, dict) and payload.get("running"):
+                    band = (payload.get("band") or "").lower()
+                    freq = payload.get("frequencyHz")
+                    if band in ("fm", "am") and isinstance(freq, (int, float)):
+                        _record_playbill_tune(parts[2], band, int(freq))
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -697,6 +820,21 @@ def get_system_prompt():
             "Only lights support brightness. Relays and other devices are on/off only.\n"
         )
 
+    if _playbill_devices:
+        prompt += "\nPlaybills (entertainment nodes):\n"
+        for slug, info in sorted(_playbill_devices.items()):
+            line = f"- \"{info['name']}\""
+            if not info["online"]:
+                line += " (offline)"
+            else:
+                radio = _describe_playbill_radio(slug)
+                vol = _describe_playbill_volume(slug)
+                bits = [b for b in (radio, vol) if b]
+                if bits:
+                    line += ": " + ", ".join(bits)
+            prompt += line + "\n"
+        prompt += "Pass the Playbill name verbatim as the \"playbill\" field.\n"
+
     return prompt
 
 
@@ -818,6 +956,235 @@ def _execute_relay_all_command(state):
     mqtt.publish(topic, payload)
     print(f"  MQTT publish: {topic} -> {payload}")
     return f"Turning {state_word} all relays."
+
+
+# --- Playbill (radio) ---
+
+# FM and AM band limits in Hz. We accept any frequency inside the band — the
+# user spoke an explicit number and we honor it; the Playbill controller and
+# rtl_fm decide what the dongle can actually tune to.
+_FM_MIN_HZ = 87_500_000
+_FM_MAX_HZ = 108_000_000
+_AM_MIN_HZ = 530_000
+_AM_MAX_HZ = 1_700_000
+
+# Fallback frequencies when a user asks to "switch to FM/AM" and we have no
+# history for that band on the target Playbill. Picked at the low end of each
+# US band — unlikely to land on a strong station, which makes the "no history
+# yet" condition obvious rather than masking it with a popular default.
+_DEFAULT_FM_HZ = 87_900_000
+_DEFAULT_AM_HZ = 540_000
+
+
+def _spoken_freq(band, freq_hz):
+    """Render a Hz value as the user would speak it (97.5 FM / 1010 AM)."""
+    if band == "fm":
+        mhz = freq_hz / 1_000_000
+        # Strip trailing zeros so 97.5 stays 97.5 and 100 stays 100.
+        return f"{mhz:.2f}".rstrip("0").rstrip(".")
+    # AM
+    return str(int(round(freq_hz / 1000)))
+
+
+def _describe_playbill_radio(slug):
+    """One-line human-readable summary of a Playbill's current radio state.
+
+    Reads the retained `local/playbill/<slug>/radio/status` payload published
+    by the Playbill controller (see TrailCurrentPlaybill controller/src/handlers/radio.js
+    setRadioState — shape is {running, band, frequencyHz, scanning, ...}).
+    """
+    radio = sensor_data.get(f"local/playbill/{slug}/radio/status")
+    if not radio or not isinstance(radio, dict):
+        return "radio idle"
+    if radio.get("scanning"):
+        band = (radio.get("scanBand") or radio.get("band") or "").upper()
+        return f"scanning {band}".strip() or "scanning"
+    if not radio.get("running"):
+        return "radio off"
+    band = (radio.get("band") or "").lower()
+    freq_hz = radio.get("frequencyHz")
+    if band in ("fm", "am") and isinstance(freq_hz, (int, float)):
+        return f"tuned to {_spoken_freq(band, int(freq_hz))} {band.upper()}"
+    return "radio on"
+
+
+def _describe_playbill_volume(slug):
+    """Render the Playbill's current volume + mute state.
+
+    Reads retained `local/playbill/<slug>/volume/status` published by the
+    Playbill controller's volume fan-out (see TrailCurrentPlaybill
+    controller/src/handlers/volume.js — state.audio shape is
+    {volumePct, muted}).
+    """
+    audio = sensor_data.get(f"local/playbill/{slug}/volume/status")
+    if not audio or not isinstance(audio, dict):
+        return ""
+    vol = audio.get("volumePct")
+    muted = audio.get("muted")
+    if muted:
+        return f"volume {vol}% muted" if isinstance(vol, (int, float)) else "muted"
+    if isinstance(vol, (int, float)):
+        return f"volume {int(round(vol))}%"
+    return ""
+
+
+def _publish_playbill_command(slug, feature, payload):
+    """Publish a JSON command to a Playbill controller via MQTT.
+
+    feature is informational (matches the controller's status-topic feature
+    label, e.g. 'radio', 'volume') — the controller's mqtt-bridge dispatches
+    by the JSON `action` field regardless.
+    """
+    topic = f"local/playbill/{slug}/{feature}/command"
+    mqtt.publish(topic, json.dumps(payload))
+    print(f"  MQTT publish: {topic} -> {payload}")
+
+
+def _resolve_playbill_target(cmd, default_to_single_online=True):
+    """Common target-resolution for any playbill.* action.
+
+    Returns (slug, display_name) or (None, message-for-user).
+    Refuses broadcast targeting — every command lands on exactly one Playbill.
+    """
+    raw = cmd.get("playbill") or cmd.get("name") or ""
+    if isinstance(raw, str) and raw.strip().lower() in ("all", "every", "everywhere", "both"):
+        if not _playbill_devices:
+            return (None, "I don't know about any Playbills yet.")
+        names = ", ".join(sorted(info["name"] for info in _playbill_devices.values()))
+        return (None, f"I can only control one Playbill at a time. Which one — {names}?")
+    if raw:
+        resolved = _resolve_playbill(raw, default_to_single_online=False)
+        if resolved:
+            return resolved
+    else:
+        resolved = _resolve_playbill("", default_to_single_online=default_to_single_online)
+        if resolved:
+            return resolved
+    if not _playbill_devices:
+        return (None, "I don't know about any Playbills yet.")
+    names = ", ".join(sorted(info["name"] for info in _playbill_devices.values()))
+    return (None, f"Which Playbill? I know about {names}.")
+
+
+_VOLUME_STEP_DEFAULT = 5
+
+
+def _execute_playbill_volume(action, cmd):
+    """Handle playbill.volumeUp / volumeDown / volumeSet.
+
+    Translates the LLM's playbill.* action into the controller's transport.*
+    bus action and publishes on local/playbill/<slug>/volume/command.
+    """
+    if not mqtt:
+        return "Sorry, I'm not connected to the device system right now."
+
+    slug, target_or_msg = _resolve_playbill_target(cmd)
+    if not slug:
+        return target_or_msg
+    target_name = target_or_msg
+
+    if action == "playbill.volumeSet":
+        try:
+            percent = int(round(float(cmd.get("percent"))))
+        except (TypeError, ValueError):
+            return "I didn't catch the volume level."
+        percent = max(0, min(100, percent))
+        _publish_playbill_command(slug, "volume",
+                                  {"action": "transport.volumeSet", "percent": percent})
+        return f"Setting {target_name} volume to {percent} percent."
+
+    # volumeUp / volumeDown
+    try:
+        step = int(round(float(cmd.get("step", _VOLUME_STEP_DEFAULT))))
+    except (TypeError, ValueError):
+        step = _VOLUME_STEP_DEFAULT
+    step = max(1, min(100, step))
+    direction = "Up" if action == "playbill.volumeUp" else "Down"
+    _publish_playbill_command(slug, "volume",
+                              {"action": f"transport.volume{direction}", "step": step})
+    verb = "Increasing" if direction == "Up" else "Decreasing"
+    return f"{verb} {target_name} volume."
+
+
+def _execute_playbill_switch_band(cmd):
+    """Switch a Playbill to the last station played on a given band.
+
+    No explicit frequency is needed; Peregrine has been tracking each running
+    tune. If a Playbill has never been heard on the requested band, we tune
+    to a safe band-default and tell the user so the silence is explained.
+    """
+    if not mqtt:
+        return "Sorry, I'm not connected to the device system right now."
+
+    band = str(cmd.get("band", "")).strip().lower()
+    if band not in ("fm", "am"):
+        return "I didn't catch the band. Say FM or AM."
+    default_hz = _DEFAULT_FM_HZ if band == "fm" else _DEFAULT_AM_HZ
+
+    slug, target_or_msg = _resolve_playbill_target(cmd)
+    if not slug:
+        return target_or_msg
+    target_name = target_or_msg
+
+    last = _playbill_last_freq.get(slug, {}).get(band)
+    freq_hz = last if last else default_hz
+    _publish_playbill_command(slug, "radio", {
+        "action": "radio.tune",
+        "value": {"band": band, "frequencyHz": freq_hz},
+    })
+    spoken = _spoken_freq(band, freq_hz)
+    if last:
+        return f"Switching {target_name} to {spoken} {band.upper()}."
+    return (f"I haven't heard {target_name} on {band.upper()} yet. "
+            f"Tuning to {spoken} {band.upper()} — say a frequency to pick a different station.")
+
+
+def _execute_playbill_tune(cmd):
+    """Tune a Playbill radio to a specific band/frequency.
+
+    Expected LLM payload:
+      {"action":"playbill.tune","playbill":"<name|all>","band":"fm","frequency":97.5}
+      {"action":"playbill.tune","playbill":"<name|all>","band":"am","frequency":1010}
+
+    `frequency` is the raw spoken number — FM-band values get interpreted as
+    MHz, AM-band values as kHz. We convert to Hz and range-check, but never
+    snap the value; the user-spoken frequency is honored exactly.
+    """
+    if not mqtt:
+        return "Sorry, I'm not connected to the device system right now."
+
+    band = str(cmd.get("band", "")).strip().lower()
+    if band not in ("fm", "am"):
+        return "I didn't catch the band. Say FM or AM."
+
+    raw_freq = cmd.get("frequency")
+    try:
+        freq = float(raw_freq)
+    except (TypeError, ValueError):
+        return "I didn't catch the frequency."
+
+    if band == "fm":
+        freq_hz = int(round(freq * 1_000_000))
+        if not (_FM_MIN_HZ <= freq_hz <= _FM_MAX_HZ):
+            return (f"{_spoken_freq('fm', freq_hz)} is outside the FM band. "
+                    "Pick a frequency between 87.5 and 108.")
+    else:
+        freq_hz = int(round(freq * 1000))
+        if not (_AM_MIN_HZ <= freq_hz <= _AM_MAX_HZ):
+            return (f"{_spoken_freq('am', freq_hz)} is outside the AM band. "
+                    "Pick a frequency between 530 and 1700.")
+
+    slug, target_or_msg = _resolve_playbill_target(cmd)
+    if not slug:
+        return target_or_msg
+    target_name = target_or_msg
+
+    _publish_playbill_command(slug, "radio", {
+        "action": "radio.tune",
+        "value": {"band": band, "frequencyHz": freq_hz},
+    })
+    spoken = _spoken_freq(band, freq_hz)
+    return f"Tuning {target_name} to {spoken} {band.upper()}."
 
 
 def _get_device_status_response(device_id, device_name):
@@ -1057,6 +1424,75 @@ def _resolve_device(text):
     if best_score >= _FUZZY_THRESHOLD and best_match:
         print(f"  Fuzzy device match: '{best_match['name']}' (score={best_score:.2f})")
         return (best_match["id"], best_match["type"], best_match["name"])
+
+    return None
+
+
+# --- Playbill resolution (named entertainment nodes from MQTT presence) ---
+
+def _resolve_playbill(text, default_to_single_online=True):
+    """Resolve a Playbill name from spoken text.
+
+    Returns (slug, name) or None. If no name is mentioned and exactly one
+    Playbill is online, returns that one (when default_to_single_online).
+    """
+    if not _playbill_devices:
+        return None
+
+    text_lower = (text or "").strip().lower()
+
+    # Exact substring match (longest first to prefer "living room" over "living")
+    for key in sorted(_playbill_by_name.keys(), key=len, reverse=True):
+        if key and key in text_lower:
+            slug = _playbill_by_name[key]
+            return (slug, _playbill_devices[slug]["name"])
+
+    # Phonetic substitution against Playbill-specific word index
+    if _playbill_word_phonetics:
+        words = text_lower.split()
+        substituted = []
+        changed = False
+        for w in words:
+            if w in _PHONETIC_SKIP or w in _playbill_words:
+                substituted.append(w)
+                continue
+            code = _metaphone(w)
+            candidates = _playbill_word_phonetics.get(code)
+            if candidates and w not in candidates:
+                best = max(candidates,
+                           key=lambda c: difflib.SequenceMatcher(None, w, c).ratio())
+                substituted.append(best)
+                changed = True
+            else:
+                substituted.append(w)
+        if changed:
+            phon = " ".join(substituted)
+            for key in sorted(_playbill_by_name.keys(), key=len, reverse=True):
+                if key in phon:
+                    slug = _playbill_by_name[key]
+                    return (slug, _playbill_devices[slug]["name"])
+
+    # Fuzzy n-gram fallback
+    words = text_lower.split()
+    best_score = 0.0
+    best = None
+    for key, slug in _playbill_by_name.items():
+        n = len(key.split())
+        for i in range(len(words) - n + 1):
+            ngram = " ".join(words[i:i + n])
+            score = difflib.SequenceMatcher(None, ngram, key).ratio()
+            if score > best_score:
+                best_score = score
+                best = slug
+    if best_score >= _FUZZY_THRESHOLD and best:
+        return (best, _playbill_devices[best]["name"])
+
+    # No match — fall back to the only online Playbill, if exactly one.
+    if default_to_single_online:
+        online = [s for s, info in _playbill_devices.items() if info["online"]]
+        if len(online) == 1:
+            slug = online[0]
+            return (slug, _playbill_devices[slug]["name"])
 
     return None
 
@@ -1925,6 +2361,15 @@ def handle_command(response_text):
         return None
 
     action = cmd.get("action")
+
+    if action == "playbill.tune":
+        return _execute_playbill_tune(cmd)
+
+    if action == "playbill.switchBand":
+        return _execute_playbill_switch_band(cmd)
+
+    if action in ("playbill.volumeUp", "playbill.volumeDown", "playbill.volumeSet"):
+        return _execute_playbill_volume(action, cmd)
 
     if action in ("light", "device", "relay", "on", "off"):
         raw_id = cmd.get("id", "all")
