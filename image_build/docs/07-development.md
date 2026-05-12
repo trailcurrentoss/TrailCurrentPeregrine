@@ -135,5 +135,9 @@ rm -rf image_build/cache
 
 ## Next
 
-You've reached the end of the docs. For the build pipeline overview see
-the top-level [README](../README.md).
+This doc covers `deploy.sh` as a *development* tool. For shipping a
+labelled, tagged software release to fielded boards via the same
+mechanism, see [docs/software-releases.md](../../docs/software-releases.md).
+For cutting a versioned **image** release see
+[08-cutting-a-release.md](08-cutting-a-release.md). For the build-pipeline
+overview see the top-level [README](../README.md).

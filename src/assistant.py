@@ -495,15 +495,31 @@ _load_playbill_freq_cache()
 
 
 def _update_playbill_presence(slug, payload):
-    """Apply a retained presence payload for one Playbill. Empty payload = forget."""
+    """Apply a retained presence payload for one Playbill. Empty payload = forget.
+
+    Playbill controllers publish system/status as a ~1Hz heartbeat, so only
+    log when the registry state actually changes (added/removed, name flip,
+    online flip) — otherwise the log floods.
+    """
     if not slug:
         return
+    prev = _playbill_devices.get(slug)
     if not payload:
-        _playbill_devices.pop(slug, None)
+        if slug in _playbill_devices:
+            _playbill_devices.pop(slug, None)
+            changed = True
+        else:
+            changed = False
     else:
         name = payload.get("name") or slug
         online = bool(payload.get("online", True))
-        _playbill_devices[slug] = {"slug": slug, "name": name, "online": online}
+        new_entry = {"slug": slug, "name": name, "online": online}
+        changed = (prev is None
+                   or prev.get("name") != name
+                   or prev.get("online") != online)
+        _playbill_devices[slug] = new_entry
+    if not changed:
+        return
     _rebuild_playbill_index()
     online_count = sum(1 for d in _playbill_devices.values() if d["online"])
     print(f"  Playbill registry: {len(_playbill_devices)} known, {online_count} online")
@@ -1091,6 +1107,11 @@ def _execute_playbill_volume(action, cmd):
         percent = max(0, min(100, percent))
         _publish_playbill_command(slug, "volume",
                                   {"action": "transport.volumeSet", "percent": percent})
+        # Setting a non-zero volume implicitly unmutes — if the user is
+        # picking a level above zero, they want to hear it.
+        if percent > 0:
+            _publish_playbill_command(slug, "volume",
+                                      {"action": "transport.muteOff"})
         return f"Setting {target_name} volume to {percent} percent."
 
     # volumeUp / volumeDown
@@ -1104,6 +1125,31 @@ def _execute_playbill_volume(action, cmd):
                               {"action": f"transport.volume{direction}", "step": step})
     verb = "Increasing" if direction == "Up" else "Decreasing"
     return f"{verb} {target_name} volume."
+
+
+def _execute_playbill_mute(action, cmd):
+    """Handle playbill.mute / unmute / muteToggle.
+
+    Publishes transport.muteOn / transport.muteOff / transport.muteToggle on
+    local/playbill/<slug>/volume/command.
+    """
+    if not mqtt:
+        return "Sorry, I'm not connected to the device system right now."
+
+    slug, target_or_msg = _resolve_playbill_target(cmd)
+    if not slug:
+        return target_or_msg
+    target_name = target_or_msg
+
+    if action == "playbill.mute":
+        bus_action, spoken_verb = "transport.muteOn", "Muting"
+    elif action == "playbill.unmute":
+        bus_action, spoken_verb = "transport.muteOff", "Unmuting"
+    else:
+        bus_action, spoken_verb = "transport.muteToggle", "Toggling mute on"
+
+    _publish_playbill_command(slug, "volume", {"action": bus_action})
+    return f"{spoken_verb} {target_name}."
 
 
 def _execute_playbill_switch_band(cmd):
@@ -1185,6 +1231,341 @@ def _execute_playbill_tune(cmd):
     })
     spoken = _spoken_freq(band, freq_hz)
     return f"Tuning {target_name} to {spoken} {band.upper()}."
+
+
+# Sources the Playbill controller registers (see TrailCurrentPlaybill
+# controller/src/sources/<id>/index.js). Maps spoken aliases → sourceId
+# and a display name used in spoken confirmation.
+_PLAYBILL_SOURCES = {
+    "youtube":      ("youtube", "YouTube"),
+    "you tube":     ("youtube", "YouTube"),
+    "cast":         ("cast",    "Cast"),
+    "airplay":      ("cast",    "Cast"),
+    "air play":     ("cast",    "Cast"),
+    "screencast":   ("cast",    "Cast"),
+    "screen cast":  ("cast",    "Cast"),
+    "phone cast":   ("cast",    "Cast"),
+}
+
+
+def _playbill_radio_status_response(text):
+    """Spoken description of the resolved Playbill's current radio state."""
+    cmd = _playbill_cmd_with_target(text, {})
+    slug, target_or_msg = _resolve_playbill_target(cmd)
+    if not slug:
+        return target_or_msg
+    target_name = target_or_msg
+    radio = sensor_data.get(f"local/playbill/{slug}/radio/status")
+    if not radio or not isinstance(radio, dict):
+        return f"I don't have radio status for {target_name}."
+    if radio.get("scanning"):
+        band = (radio.get("scanBand") or radio.get("band") or "").upper()
+        return (f"{target_name} is scanning {band}." if band
+                else f"{target_name} is scanning.")
+    if not radio.get("running"):
+        return f"{target_name}'s radio is off."
+    band = (radio.get("band") or "").lower()
+    freq_hz = radio.get("frequencyHz")
+    if band in ("fm", "am") and isinstance(freq_hz, (int, float)):
+        spoken = _spoken_freq(band, int(freq_hz))
+        return f"{target_name} is tuned to {spoken} {band.upper()}."
+    return f"{target_name}'s radio is on."
+
+
+def _playbill_volume_status_response(text):
+    """Spoken description of the resolved Playbill's current volume / mute."""
+    cmd = _playbill_cmd_with_target(text, {})
+    slug, target_or_msg = _resolve_playbill_target(cmd)
+    if not slug:
+        return target_or_msg
+    target_name = target_or_msg
+    audio = sensor_data.get(f"local/playbill/{slug}/volume/status")
+    if not audio or not isinstance(audio, dict):
+        return f"I don't have volume status for {target_name}."
+    vol = audio.get("volumePct")
+    muted = audio.get("muted")
+    if muted:
+        if isinstance(vol, (int, float)):
+            return (f"{target_name} is muted. Volume is at "
+                    f"{int(round(vol))} percent.")
+        return f"{target_name} is muted."
+    if isinstance(vol, (int, float)):
+        return f"{target_name} volume is {int(round(vol))} percent."
+    return f"I don't have volume status for {target_name}."
+
+
+def _execute_playbill_source_launch(cmd):
+    """Tell a Playbill GUI to switch to a registered source's browse screen.
+
+    Publishes {action: source.launch, sourceId: <id>} on
+    local/playbill/<slug>/source/command. The Playbill controller's
+    source.launch handler patches state.source and, if the GUI isn't
+    running, dispatches system.launchGui too.
+    """
+    if not mqtt:
+        return "Sorry, I'm not connected to the device system right now."
+
+    source_id = cmd.get("sourceId")
+    display = cmd.get("display") or source_id
+    if not source_id:
+        return "I didn't catch which app."
+
+    slug, target_or_msg = _resolve_playbill_target(cmd)
+    if not slug:
+        return target_or_msg
+    target_name = target_or_msg
+
+    _publish_playbill_command(slug, "source", {
+        "action": "source.launch",
+        "sourceId": source_id,
+    })
+    return f"Launching {display} on {target_name}."
+
+
+# --- Playbill direct intent matching (skip the LLM for radio/volume) ---
+
+# Frequency after a tune-verb: "tune to 97.5", "play 97.5 FM", "go to 1010 AM".
+# "turn" is included to cover the common Whisper mishearing "Turn the radio
+# to 97.5" — false-matches on "turn light 95 on" are blocked by the
+# radio-context guard in _match_playbill_intent below.
+_PLAYBILL_TUNE_VERB_FREQ_RE = re.compile(
+    r"\b(?:tune|turn|play|put\s+on|listen\s+to|go\s+to|switch(?:\s+to)?)\b"
+    r"[^\d]*"
+    r"(\d{2,4}(?:\.\d+)?)"
+    r"\s*(fm|am|mhz|khz|megahertz|kilohertz)?\b",
+    re.I,
+)
+# Words/units that confirm the user is talking about a Playbill / radio,
+# not a light/relay. Includes "playbill", "audio", and "sound" so commands
+# like "set Playbill volume to 25 percent" or "audio off" disambiguate.
+_PLAYBILL_RADIO_CONTEXT_RE = re.compile(
+    r"\b(?:radio|station|fm|am|mhz|khz|megahertz|kilohertz|"
+    r"playbill|audio|sound)\b",
+    re.I,
+)
+# Frequency followed by explicit band/unit, no verb required: "97.5 FM"
+_PLAYBILL_FREQ_BAND_RE = re.compile(
+    r"\b(\d{2,4}(?:\.\d+)?)\s*(fm|am|mhz|khz|megahertz|kilohertz)\b",
+    re.I,
+)
+# Band switch with no frequency: "switch to FM", "play AM radio", "turn on FM"
+_PLAYBILL_BAND_SWITCH_RE = re.compile(
+    r"\b(?:switch(?:\s+to)?|play|turn\s+on|put\s+on|listen\s+to|go\s+to)"
+    r"\s+(?:(?:the|to)\s+)*"
+    r"(am|fm)(?:\s+(?:radio|band|station))?\b",
+    re.I,
+)
+# Volume set: "set the volume to 50 percent", "set Playbill volume to 25 percent",
+# "volume to 50 percent". Also accepts "value" as a common Whisper mishearing
+# of "volume" — when that match wins, _match_playbill_intent re-checks for
+# radio/playbill context so unrelated phrases ("set the database value...")
+# don't get hijacked.
+_PLAYBILL_VOLUME_SET_RE = re.compile(
+    r"\b(?:set|adjust|change|put)\s+"
+    r"(?:[\w'-]+\s+){0,4}?"
+    r"(?P<word>volume|value)\s+"
+    r"(?:to\s+|at\s+)?(?P<pct>\d+)\s*percent\b"
+    r"|"
+    r"\b(?P<word2>volume)\s+(?:to\s+|at\s+)?(?P<pct2>\d+)\s*percent\b",
+    re.I,
+)
+# Volume up
+_PLAYBILL_VOLUME_UP_RES = [
+    re.compile(r"\b(?:volume|sound)\s+up\b", re.I),
+    re.compile(r"\b(?:turn|crank|kick|pump)\s+(?:it|the\s+(?:volume|radio|sound|music))\s+up\b", re.I),
+    re.compile(r"\bturn\s+up\s+(?:the\s+)?(?:volume|radio|sound|music)\b", re.I),
+    re.compile(r"\bincrease\s+(?:the\s+)?volume\b", re.I),
+    re.compile(r"\b(?:make\s+it\s+|play\s+it\s+)?louder\b", re.I),
+]
+# Volume down
+_PLAYBILL_VOLUME_DOWN_RES = [
+    re.compile(r"\b(?:volume|sound)\s+down\b", re.I),
+    re.compile(r"\b(?:turn|kick)\s+(?:it|the\s+(?:volume|radio|sound|music))\s+down\b", re.I),
+    re.compile(r"\bturn\s+down\s+(?:the\s+)?(?:volume|radio|sound|music)\b", re.I),
+    re.compile(r"\bdecrease\s+(?:the\s+)?volume\b", re.I),
+    re.compile(r"\b(?:make\s+it\s+)?(?:quieter|softer)\b", re.I),
+]
+# Source-launch verbs ("launch", "open", "start", "show", "switch to", "go to", "run").
+_PLAYBILL_LAUNCH_VERB_RE = re.compile(
+    r"\b(?:launch|open|start|show|run|switch\s+to|go\s+to)\b",
+    re.I,
+)
+
+# Status-query triggers ("what is", "what's", "which", "is", "are",
+# "current", "currently", "how loud") — used together with a target word
+# to detect a Playbill state question.
+_PLAYBILL_QUERY_TRIGGER_RE = re.compile(
+    r"\b(?:what(?:'s|s|\s+is|\s+are)?|which|is|are|how\s+(?:loud|quiet)|"
+    r"current(?:ly)?|status)\b",
+    re.I,
+)
+_PLAYBILL_RADIO_QUERY_TARGET_RE = re.compile(
+    r"\b(?:radio|station|frequency|tuned|tune)\b",
+    re.I,
+)
+_PLAYBILL_VOLUME_QUERY_TARGET_RE = re.compile(
+    r"\b(?:volume|muted|mute|loud|quiet)\b",
+    re.I,
+)
+
+
+# Mute / unmute / toggle. "unmute" before "mute" so the inverse keyword wins.
+_PLAYBILL_UNMUTE_RE = re.compile(
+    r"\b(?:unmute|un-mute|undo\s+mute|cancel\s+mute|"
+    r"turn\s+(?:the\s+)?(?:sound|audio|volume|radio|playbill)\s+back\s+on)\b",
+    re.I,
+)
+_PLAYBILL_MUTE_TOGGLE_RE = re.compile(
+    r"\btoggle\s+(?:the\s+)?mute\b|\bmute\s+toggle\b",
+    re.I,
+)
+_PLAYBILL_MUTE_RE = re.compile(
+    r"\b(?:mute|silence|hush|shush|"
+    r"(?:be\s+)?quiet(?:\s+for\s+(?:a\s+)?(?:moment|second|minute))?|"
+    r"shut\s+up|"
+    r"turn\s+(?:the\s+)?(?:sound|audio|volume|radio|playbill)\s+off)\b",
+    re.I,
+)
+
+
+def _infer_band(freq, unit):
+    """Pick fm/am from explicit unit, or infer from frequency value. None = unknown."""
+    u = (unit or "").lower()
+    if u in ("fm", "mhz", "megahertz"):
+        return "fm"
+    if u in ("am", "khz", "kilohertz"):
+        return "am"
+    if 87.5 <= freq <= 108.0:
+        return "fm"
+    if 530 <= freq <= 1700:
+        return "am"
+    return None
+
+
+def _playbill_cmd_with_target(text, base):
+    """Attach a 'playbill' field by resolving the spoken text against the registry."""
+    cmd = dict(base)
+    resolved = _resolve_playbill(text, default_to_single_online=False)
+    if resolved:
+        cmd["playbill"] = resolved[1]
+    return cmd
+
+
+def _match_playbill_intent(text):
+    """Match Playbill radio/volume intents directly (no LLM).
+
+    Returns a spoken response string, or None if nothing matched.
+    """
+    if not _playbill_devices:
+        return None
+
+    # Status queries first — "what's playing on the radio", "is it muted",
+    # "what's the current station". Volume queries take precedence over
+    # radio queries when both contexts appear (e.g. "is the radio volume
+    # too loud") since volume is the more specific target.
+    if _PLAYBILL_QUERY_TRIGGER_RE.search(text):
+        if _PLAYBILL_VOLUME_QUERY_TARGET_RE.search(text):
+            print("  Intent: playbill volume status query")
+            return _playbill_volume_status_response(text)
+        if _PLAYBILL_RADIO_QUERY_TARGET_RE.search(text):
+            print("  Intent: playbill radio status query")
+            return _playbill_radio_status_response(text)
+
+    # Mute / unmute / toggle — check before generic volume so "mute" and
+    # "unmute" don't fall through to the volumeUp/Down patterns.
+    if _PLAYBILL_UNMUTE_RE.search(text):
+        cmd = _playbill_cmd_with_target(text, {"action": "playbill.unmute"})
+        print("  Intent: playbill unmute")
+        return _execute_playbill_mute("playbill.unmute", cmd)
+    if _PLAYBILL_MUTE_TOGGLE_RE.search(text):
+        cmd = _playbill_cmd_with_target(text, {"action": "playbill.muteToggle"})
+        print("  Intent: playbill muteToggle")
+        return _execute_playbill_mute("playbill.muteToggle", cmd)
+    if _PLAYBILL_MUTE_RE.search(text):
+        cmd = _playbill_cmd_with_target(text, {"action": "playbill.mute"})
+        print("  Intent: playbill mute")
+        return _execute_playbill_mute("playbill.mute", cmd)
+
+    # Volume set (must come before volumeUp/Down since "set volume to 50 percent"
+    # contains no up/down keyword but is the most specific match).
+    m = _PLAYBILL_VOLUME_SET_RE.search(text)
+    if m:
+        word = (m.group("word") or m.group("word2") or "").lower()
+        pct_str = m.group("pct") or m.group("pct2") or "0"
+        # "value" is only treated as a volume command when the text otherwise
+        # mentions a Playbill/radio/audio/sound — otherwise it's almost
+        # certainly some unrelated "set X value to N percent" usage.
+        if word == "value" and not _PLAYBILL_RADIO_CONTEXT_RE.search(text):
+            pass
+        else:
+            percent = max(0, min(100, int(pct_str)))
+            cmd = _playbill_cmd_with_target(text, {"action": "playbill.volumeSet",
+                                                   "percent": percent})
+            print(f"  Intent: playbill volumeSet ({percent}%)")
+            return _execute_playbill_volume("playbill.volumeSet", cmd)
+
+    for pat in _PLAYBILL_VOLUME_UP_RES:
+        if pat.search(text):
+            cmd = _playbill_cmd_with_target(text, {"action": "playbill.volumeUp"})
+            print("  Intent: playbill volumeUp")
+            return _execute_playbill_volume("playbill.volumeUp", cmd)
+
+    for pat in _PLAYBILL_VOLUME_DOWN_RES:
+        if pat.search(text):
+            cmd = _playbill_cmd_with_target(text, {"action": "playbill.volumeDown"})
+            print("  Intent: playbill volumeDown")
+            return _execute_playbill_volume("playbill.volumeDown", cmd)
+
+    # Tune to a specific frequency.
+    m = _PLAYBILL_TUNE_VERB_FREQ_RE.search(text) or _PLAYBILL_FREQ_BAND_RE.search(text)
+    if m:
+        try:
+            freq = float(m.group(1))
+        except (TypeError, ValueError):
+            freq = None
+        unit = m.group(2)
+        # Only treat this as a tune intent if the number looks like a
+        # frequency (decimal point, explicit FM/AM/MHz/kHz, or a clear
+        # radio/station word). Without one of those, things like
+        # "turn light 95 on" or "set light 1 to 100 percent" would
+        # otherwise infer an FM band from the bare digits.
+        is_decimal = "." in m.group(1)
+        radio_context = bool(_PLAYBILL_RADIO_CONTEXT_RE.search(text))
+        if freq is not None and (unit or is_decimal or radio_context):
+            band = _infer_band(freq, unit)
+            if band:
+                cmd = _playbill_cmd_with_target(text, {"action": "playbill.tune",
+                                                       "band": band,
+                                                       "frequency": freq})
+                print(f"  Intent: playbill tune ({band.upper()} {freq})")
+                return _execute_playbill_tune(cmd)
+
+    # Band-only switch ("switch to FM" with no frequency).
+    m = _PLAYBILL_BAND_SWITCH_RE.search(text)
+    if m:
+        band = m.group(1).lower()
+        cmd = _playbill_cmd_with_target(text, {"action": "playbill.switchBand",
+                                               "band": band})
+        print(f"  Intent: playbill switchBand ({band.upper()})")
+        return _execute_playbill_switch_band(cmd)
+
+    # Source launch — "Launch YouTube on Playbill", "Open Cast",
+    # "Start AirPlay", "Go to YouTube".
+    if _PLAYBILL_LAUNCH_VERB_RE.search(text):
+        t_lower = text.lower()
+        # Longest aliases first so "you tube" wins over "you"-style fragments.
+        for alias in sorted(_PLAYBILL_SOURCES.keys(), key=len, reverse=True):
+            if re.search(r"\b" + re.escape(alias) + r"\b", t_lower):
+                source_id, display = _PLAYBILL_SOURCES[alias]
+                cmd = _playbill_cmd_with_target(text, {
+                    "action": "playbill.sourceLaunch",
+                    "sourceId": source_id,
+                    "display": display,
+                })
+                print(f"  Intent: playbill sourceLaunch ({source_id})")
+                return _execute_playbill_source_launch(cmd)
+
+    return None
 
 
 def _get_device_status_response(device_id, device_name):
@@ -1358,7 +1739,13 @@ def _phonetic_substitute(text_lower):
         if w in _PHONETIC_SKIP or w in _device_words:
             result.append(w)
             continue
+        if not any(c.isalpha() for c in w):
+            result.append(w)
+            continue
         code = _metaphone(w)
+        if not code:
+            result.append(w)
+            continue
         candidates = _device_word_phonetics.get(code)
         if candidates and w not in candidates:
             best = max(candidates,
@@ -1456,7 +1843,13 @@ def _resolve_playbill(text, default_to_single_online=True):
             if w in _PHONETIC_SKIP or w in _playbill_words:
                 substituted.append(w)
                 continue
+            if not any(c.isalpha() for c in w):
+                substituted.append(w)
+                continue
             code = _metaphone(w)
+            if not code:
+                substituted.append(w)
+                continue
             candidates = _playbill_word_phonetics.get(code)
             if candidates and w not in candidates:
                 best = max(candidates,
@@ -1952,6 +2345,13 @@ def match_intent(text):
                 return "The trailer is not level. It's " + ", and ".join(parts) + "."
             return "I don't have level sensor data right now."
 
+    # --- Playbill radio / volume (run before device resolution so "tune the
+    #     radio to 97.5" doesn't get eaten by a relay/light called "radio",
+    #     and so the LLM never has to handle structured radio commands) ---
+    playbill_resp = _match_playbill_intent(text)
+    if playbill_resp:
+        return playbill_resp
+
     # --- Named device resolution (dynamic from MQTT config) ---
     device = _resolve_device(text)
     if device:
@@ -2272,41 +2672,6 @@ def match_intent(text):
             if details and details.get("numberOfSatellites") is not None:
                 return f"We're currently tracking {details['numberOfSatellites']} satellites."
             return "I don't have satellite data right now."
-
-    # --- Module identity queries ("what is Borealis?", "what does Torrent do?") ---
-    # Handled here to prevent the 1B model's incorrect training priors
-    # (e.g. "Borealis = Aurora Borealis = light") from overriding factual answers.
-    _MODULE_DESCRIPTIONS = {
-        "bearing":    "Bearing is a GNSS module. It provides GPS positioning, heading, altitude, and precise timing over the CAN bus.",
-        "borealis":   "Borealis is an air quality sensor. It measures temperature, humidity, TVOC, and CO2. It is read-only and cannot control anything.",
-        "plateau":    "Plateau is a vehicle leveling sensor. It measures tilt on both axes and calculates how many inches each corner is off level.",
-        "ampline":    "Ampline is a battery shunt gateway. It measures voltage, current, power, and state of charge from a shunt on your battery bank.",
-        "picket":     "Picket is a door and cabinet sensor module. It monitors open and closed states for up to several doors or compartments.",
-        "tapper":     "Tapper is an 8-button control panel. Pressing its buttons sends commands to control lights or relays on the CAN bus.",
-        "torrent":    "Torrent is an 8-channel PWM power distribution module. It controls vehicle lighting and accessories with on/off and brightness control.",
-        "solstice":   "Solstice is a solar MPPT charge controller gateway. It reads data from a Victron MPPT controller and publishes it to the CAN bus.",
-        "aftline":    "Aftline is a trailer wiring monitor. It detects the state of trailer connector pins to verify lighting and brake connections.",
-        "therma":     "Therma is a closed-loop thermostat controller. It drives a relay to maintain a target temperature using a temperature sensor.",
-        "switchback":  "Switchback is an 8-channel relay module. It can switch higher-current loads on and off, such as appliances or accessory circuits.",
-        "reservoir":  "Reservoir monitors water tank levels using ultrasonic sensors. It can track fresh, grey, and black water tanks.",
-        "milepost":   "Milepost is a hardwired 7-inch touchscreen display. It shows vehicle status and allows local control without needing a phone or app.",
-        "fireside":   "Fireside is a wireless 7-inch touchscreen display. It connects over WiFi and MQTT to show status and provide control.",
-        "headwaters": "Headwaters is the in-vehicle compute gateway. It runs on a Raspberry Pi CM5 and hosts the MQTT broker, tile server, CAN bridge, and Docker services.",
-        "farwatch":   "Farwatch is the optional cloud platform. It is a self-hosted web app for remote monitoring and control when the vehicle has internet access.",
-        "peregrine":  "Peregrine is the voice assistant you are talking to. It runs on a Radxa Dragon Q6A and uses a local LLM on the Hexagon NPU.",
-        "spotter":    "Spotter is a compact trailer monitor display. It shows towing alarms and offers remote control for the trailer being towed.",
-        "trailcurrent": "TrailCurrent is a 100% open source Software Defined Vehicle platform. It is community-developed and provides a complete system for vehicle monitoring, control, and autonomous decision-making.",
-    }
-    _MODULE_QUERY_RE = re.compile(
-        r'\b(what\s+(is|are|does|do)|tell me about|describe|explain)\b',
-        re.IGNORECASE
-    )
-    if _MODULE_QUERY_RE.search(text):
-        text_lower = text.lower()
-        for name, description in _MODULE_DESCRIPTIONS.items():
-            if re.search(r'\b' + re.escape(name) + r'\b', text_lower):
-                print(f"  Intent: module identity query ({name})")
-                return description
 
     return None  # No intent matched, fall back to LLM
 
@@ -2949,27 +3314,6 @@ def _canned_phrases_for_cache():
         "I don't have satellite data right now.",
         "Your current timezone doesn't observe daylight saving time.",
         "I don't have location data to determine time zone changes.",
-
-        # Module identity responses (17 fixed descriptions from match_intent)
-        "Bearing is a GNSS module. It provides GPS positioning, heading, altitude, and precise timing over the CAN bus.",
-        "Borealis is an air quality sensor. It measures temperature, humidity, TVOC, and CO2. It is read-only and cannot control anything.",
-        "Plateau is a vehicle leveling sensor. It measures tilt on both axes and calculates how many inches each corner is off level.",
-        "Ampline is a battery shunt gateway. It measures voltage, current, power, and state of charge from a shunt on your battery bank.",
-        "Picket is a door and cabinet sensor module. It monitors open and closed states for up to several doors or compartments.",
-        "Tapper is an 8-button control panel. Pressing its buttons sends commands to control lights or relays on the CAN bus.",
-        "Torrent is an 8-channel PWM power distribution module. It controls vehicle lighting and accessories with on/off and brightness control.",
-        "Solstice is a solar MPPT charge controller gateway. It reads data from a Victron MPPT controller and publishes it to the CAN bus.",
-        "Aftline is a trailer wiring monitor. It detects the state of trailer connector pins to verify lighting and brake connections.",
-        "Therma is a closed-loop thermostat controller. It drives a relay to maintain a target temperature using a temperature sensor.",
-        "Switchback is an 8-channel relay module. It can switch higher-current loads on and off, such as appliances or accessory circuits.",
-        "Reservoir monitors water tank levels using ultrasonic sensors. It can track fresh, grey, and black water tanks.",
-        "Milepost is a hardwired 7-inch touchscreen display. It shows vehicle status and allows local control without needing a phone or app.",
-        "Fireside is a wireless 7-inch touchscreen display. It connects over WiFi and MQTT to show status and provide control.",
-        "Headwaters is the in-vehicle compute gateway. It runs on a Raspberry Pi CM5 and hosts the MQTT broker, tile server, CAN bridge, and Docker services.",
-        "Farwatch is the optional cloud platform. It is a self-hosted web app for remote monitoring and control when the vehicle has internet access.",
-        "Peregrine is the voice assistant you are talking to. It runs on a Radxa Dragon Q6A and uses a local LLM on the Hexagon NPU.",
-        "Spotter is a compact trailer monitor display. It shows towing alarms and offers remote control for the trailer being towed.",
-        "TrailCurrent is a 100% open source Software Defined Vehicle platform. It is community-developed and provides a complete system for vehicle monitoring, control, and autonomous decision-making.",
     ]
     # Also pre-render per-device confirmations using the currently-known names,
     # so first-use is instant for any device the registry already has.

@@ -99,6 +99,9 @@ Read the docs in order:
 5. [First login](docs/05-first-login.md) — the wizard, password change, MQTT, self-test
 6. [Troubleshooting](docs/06-troubleshooting.md) — when things go wrong
 7. [Development](docs/07-development.md) — `deploy.sh` for fast iteration on `src/`
+8. [Cutting an image release](docs/08-cutting-a-release.md) — versioning, building, compressing, tagging, distributing
+
+For **software-only releases** (changes that don't need a reflash — `src/`, models, service files), see [../docs/software-releases.md](../docs/software-releases.md). That's the parallel release track.
 
 ## Total time, fresh board to working assistant
 

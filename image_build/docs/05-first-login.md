@@ -75,6 +75,11 @@ your laptop:
 scp ca.pem trailcurrent@peregrine.local:/home/trailcurrent/ca.pem
 ```
 
+You can grab the CA off the Headwaters web UI (https://headwaters.local →
+**Settings** → **CA Certificate** panel — copy the PEM from the textarea).
+For the full install / rotation procedure see
+[docs/mqtt-ca-cert.md](../../docs/mqtt-ca-cert.md).
+
 You can skip this step entirely by answering `n`. The assistant will run
 without MQTT — wake-word + STT + LLM + TTS still all work locally; you just
 don't get cloud telemetry.

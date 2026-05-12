@@ -43,7 +43,11 @@ ssh trailcurrent@peregrine.local           # password: trailcurrent
 # 5. Say "hey peregrine"
 ```
 
-Full walkthrough → [image_build/README.md](image_build/README.md) and the seven docs in [image_build/docs/](image_build/docs/).
+Full walkthrough → [image_build/README.md](image_build/README.md) and the eight docs in [image_build/docs/](image_build/docs/).
+
+Two release tracks:
+- **Image release** ([image_build/docs/08-cutting-a-release.md](image_build/docs/08-cutting-a-release.md)) — full reflash, used when OS / venv / NPU model / branding change.
+- **Software release** ([docs/software-releases.md](docs/software-releases.md)) — `src/`, models, and service files only, pushed to live boards via `deploy.sh`.
 
 ## Project structure
 
@@ -130,6 +134,11 @@ sudo journalctl -u voice-assistant -f
 
 Without MQTT configured, the assistant still answers general questions —
 device-control commands will just report "not connected."
+
+For TLS to a self-signed Headwaters broker, the CA cert is installed at
+`/home/trailcurrent/ca.pem` and obtained from the **Headwaters Settings
+page** (https://headwaters.local → Settings → CA Certificate panel). For
+the install/rotation procedure see [docs/mqtt-ca-cert.md](docs/mqtt-ca-cert.md).
 
 ## Voice Commands
 
