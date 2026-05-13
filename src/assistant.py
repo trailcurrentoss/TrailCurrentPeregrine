@@ -625,6 +625,9 @@ def _connect_mqtt():
             client.subscribe("local/playbill/+/system/status")
             client.subscribe("local/playbill/+/radio/status")
             client.subscribe("local/playbill/+/volume/status")
+            client.subscribe("local/playbill/+/source/status")
+            client.subscribe("local/playbill/+/transport/status")
+            client.subscribe("local/playbill/+/cast/status")
             # Request current config from Headwaters (in case retained topics are stale/absent)
             client.publish("local/config/request", json.dumps({"source": "peregrine"}), qos=1)
             _mqtt_connected.set()
@@ -1152,6 +1155,63 @@ def _execute_playbill_mute(action, cmd):
     return f"{spoken_verb} {target_name}."
 
 
+def _execute_playbill_radio_stop(cmd):
+    """Stop the Playbill radio tuner without muting other audio sources."""
+    if not mqtt:
+        return "Sorry, I'm not connected to the device system right now."
+
+    slug, target_or_msg = _resolve_playbill_target(cmd)
+    if not slug:
+        return target_or_msg
+    target_name = target_or_msg
+
+    _publish_playbill_command(slug, "radio", {"action": "radio.stop"})
+    return f"Stopping {target_name}'s radio."
+
+
+def _execute_playbill_radio_start(cmd):
+    """Resume the Playbill radio on the last-known station.
+
+    Prefers the most recently heard band (from the retained radio status
+    topic); falls back to the last FM frequency, then the last AM, then the
+    FM default. Tells the user when no station has been heard yet so the
+    default-frequency tune isn't a surprise.
+    """
+    if not mqtt:
+        return "Sorry, I'm not connected to the device system right now."
+
+    slug, target_or_msg = _resolve_playbill_target(cmd)
+    if not slug:
+        return target_or_msg
+    target_name = target_or_msg
+
+    last_by_band = _playbill_last_freq.get(slug, {})
+    status = sensor_data.get(f"local/playbill/{slug}/radio/status") or {}
+    preferred_band = (status.get("band") or "").lower() if isinstance(status, dict) else ""
+
+    band = None
+    freq_hz = None
+    if preferred_band in ("fm", "am") and last_by_band.get(preferred_band):
+        band = preferred_band
+        freq_hz = last_by_band[preferred_band]
+    elif last_by_band.get("fm"):
+        band, freq_hz = "fm", last_by_band["fm"]
+    elif last_by_band.get("am"):
+        band, freq_hz = "am", last_by_band["am"]
+    else:
+        band, freq_hz = "fm", _DEFAULT_FM_HZ
+
+    _publish_playbill_command(slug, "radio", {
+        "action": "radio.tune",
+        "value": {"band": band, "frequencyHz": freq_hz},
+    })
+    spoken = _spoken_freq(band, freq_hz)
+    if last_by_band.get(band):
+        return f"Starting {target_name}'s radio on {spoken} {band.upper()}."
+    return (f"I haven't heard {target_name} on the radio yet. "
+            f"Tuning to {spoken} {band.upper()} — say a frequency to pick a different station.")
+
+
 def _execute_playbill_switch_band(cmd):
     """Switch a Playbill to the last station played on a given band.
 
@@ -1270,6 +1330,70 @@ def _playbill_radio_status_response(text):
         spoken = _spoken_freq(band, int(freq_hz))
         return f"{target_name} is tuned to {spoken} {band.upper()}."
     return f"{target_name}'s radio is on."
+
+
+_PLAYBILL_SOURCE_LABELS = {
+    "radio":   "the radio",
+    "livetv":  "live TV",
+    "youtube": "YouTube",
+    "cast":    "AirPlay",
+    "netflix": "Netflix",
+    "plex":    "Plex",
+    "local":   "the library",
+}
+
+
+def _playbill_nowplaying_status_response(text):
+    """Describe what's currently playing on the resolved Playbill.
+
+    Reads `local/playbill/<slug>/source/status` to learn the active source
+    (radio | cast | youtube | netflix | livetv | plex | local | null) and then pulls
+    detail from the matching feature topic — radio status for FM/AM, cast
+    status for the AirPlay client name, transport status for an mpv-driven
+    title.
+    """
+    cmd = _playbill_cmd_with_target(text, {})
+    slug, target_or_msg = _resolve_playbill_target(cmd)
+    if not slug:
+        return target_or_msg
+    target_name = target_or_msg
+
+    src_payload = sensor_data.get(f"local/playbill/{slug}/source/status")
+    source = src_payload.get("source") if isinstance(src_payload, dict) else None
+    if not source:
+        return f"Nothing's playing on {target_name}."
+
+    if source == "radio":
+        radio = sensor_data.get(f"local/playbill/{slug}/radio/status")
+        if isinstance(radio, dict) and radio.get("running"):
+            band = (radio.get("band") or "").lower()
+            freq_hz = radio.get("frequencyHz")
+            if band in ("fm", "am") and isinstance(freq_hz, (int, float)):
+                spoken = _spoken_freq(band, int(freq_hz))
+                return f"{target_name} is playing {spoken} {band.upper()}."
+        return f"{target_name} is playing the radio."
+
+    if source == "cast":
+        cast = sensor_data.get(f"local/playbill/{slug}/cast/status")
+        client_name = cast.get("clientName") if isinstance(cast, dict) else None
+        if client_name:
+            return f"{target_name} is playing AirPlay from {client_name}."
+        return f"{target_name} is on AirPlay."
+
+    # mpv-driven sources (youtube, plex, livetv-via-tsPath, local library)
+    # carry a title on the transport/status topic.
+    transport = sensor_data.get(f"local/playbill/{slug}/transport/status")
+    title = None
+    if isinstance(transport, dict):
+        title = transport.get("title") or transport.get("name")
+    if source == "local":
+        if title:
+            return f"{target_name} is playing {title} from the library."
+        return f"{target_name} is playing from the library."
+    label = _PLAYBILL_SOURCE_LABELS.get(source, source)
+    if title:
+        return f"{target_name} is playing {title} on {label}."
+    return f"{target_name} is playing {label}."
 
 
 def _playbill_volume_status_response(text):
@@ -1407,23 +1531,55 @@ _PLAYBILL_VOLUME_QUERY_TARGET_RE = re.compile(
     r"\b(?:volume|muted|mute|loud|quiet)\b",
     re.I,
 )
+# General "what's playing" — covers any source (radio, YouTube, Cast,
+# Netflix, etc.). Checked AFTER the radio/volume targets so a more specific
+# question ("what station is playing") still routes to the radio handler.
+_PLAYBILL_NOWPLAYING_QUERY_TARGET_RE = re.compile(
+    r"\bplaying\b",
+    re.I,
+)
 
 
-# Mute / unmute / toggle. "unmute" before "mute" so the inverse keyword wins.
+# Mute / unmute / toggle. Mute is the GLOBAL audio mute and requires an
+# explicit target noun (sound/audio/volume/playbill) — bare "mute" / "shut
+# up" / "be quiet" no longer trigger, to avoid false positives. "sound" and
+# "audio" are interchangeable. "radio" is NOT here — that controls the
+# tuner, handled by _PLAYBILL_RADIO_STOP_RE / _PLAYBILL_RADIO_START_RE.
+_PLAYBILL_MUTE_TARGET = r"(?:sound|audio|volume|playbill)"
 _PLAYBILL_UNMUTE_RE = re.compile(
-    r"\b(?:unmute|un-mute|undo\s+mute|cancel\s+mute|"
-    r"turn\s+(?:the\s+)?(?:sound|audio|volume|radio|playbill)\s+back\s+on)\b",
+    rf"\b(?:unmute|un-mute)\s+(?:the\s+)?{_PLAYBILL_MUTE_TARGET}\b|"
+    rf"\bturn\s+(?:the\s+)?{_PLAYBILL_MUTE_TARGET}\s+back\s+on\b|"
+    rf"\bturn\s+(?:back\s+)?on\s+(?:the\s+)?{_PLAYBILL_MUTE_TARGET}\b",
     re.I,
 )
 _PLAYBILL_MUTE_TOGGLE_RE = re.compile(
-    r"\btoggle\s+(?:the\s+)?mute\b|\bmute\s+toggle\b",
+    rf"\btoggle\s+(?:the\s+)?mute\b|"
+    rf"\bmute\s+toggle\b|"
+    rf"\btoggle\s+(?:the\s+)?{_PLAYBILL_MUTE_TARGET}\s+mute\b",
     re.I,
 )
 _PLAYBILL_MUTE_RE = re.compile(
-    r"\b(?:mute|silence|hush|shush|"
-    r"(?:be\s+)?quiet(?:\s+for\s+(?:a\s+)?(?:moment|second|minute))?|"
-    r"shut\s+up|"
-    r"turn\s+(?:the\s+)?(?:sound|audio|volume|radio|playbill)\s+off)\b",
+    rf"\b(?:mute|silence)\s+(?:the\s+)?{_PLAYBILL_MUTE_TARGET}\b|"
+    rf"\bturn\s+(?:the\s+)?{_PLAYBILL_MUTE_TARGET}\s+off\b|"
+    rf"\bturn\s+off\s+(?:the\s+)?{_PLAYBILL_MUTE_TARGET}\b",
+    re.I,
+)
+
+# Radio tuner stop/start — distinct from mute. "Stop the radio" / "turn off
+# the radio" halts the tuner (radio.stop) so other audio sources can still
+# play. "Turn on the radio" / "start the radio" resumes the last station.
+_PLAYBILL_RADIO_STOP_RE = re.compile(
+    r"\b(?:stop|kill|cut|halt)\s+(?:the\s+)?radio\b|"
+    r"\bturn\s+(?:the\s+)?radio\s+off\b|"
+    r"\bturn\s+off\s+(?:the\s+)?radio\b|"
+    r"\bradio\s+off\b",
+    re.I,
+)
+_PLAYBILL_RADIO_START_RE = re.compile(
+    r"\b(?:start|resume|play)\s+(?:the\s+)?radio\b|"
+    r"\bturn\s+(?:the\s+)?radio\s+(?:back\s+)?on\b|"
+    r"\bturn\s+(?:back\s+)?on\s+(?:the\s+)?radio\b|"
+    r"\bradio\s+on\b",
     re.I,
 )
 
@@ -1470,6 +1626,20 @@ def _match_playbill_intent(text):
         if _PLAYBILL_RADIO_QUERY_TARGET_RE.search(text):
             print("  Intent: playbill radio status query")
             return _playbill_radio_status_response(text)
+        if _PLAYBILL_NOWPLAYING_QUERY_TARGET_RE.search(text):
+            print("  Intent: playbill now-playing query")
+            return _playbill_nowplaying_status_response(text)
+
+    # Radio tuner stop/start — must come before mute so "turn off the radio"
+    # halts the tuner instead of muting all audio output.
+    if _PLAYBILL_RADIO_STOP_RE.search(text):
+        cmd = _playbill_cmd_with_target(text, {"action": "playbill.radioStop"})
+        print("  Intent: playbill radioStop")
+        return _execute_playbill_radio_stop(cmd)
+    if _PLAYBILL_RADIO_START_RE.search(text):
+        cmd = _playbill_cmd_with_target(text, {"action": "playbill.radioStart"})
+        print("  Intent: playbill radioStart")
+        return _execute_playbill_radio_start(cmd)
 
     # Mute / unmute / toggle — check before generic volume so "mute" and
     # "unmute" don't fall through to the volumeUp/Down patterns.
