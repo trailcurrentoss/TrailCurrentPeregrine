@@ -193,6 +193,12 @@ done
 fix "Pin Jabra as default ALSA device"
 cp "$SCRIPT_DIR/files/alsa/asound.conf" "$MOUNT_DIR/etc/asound.conf"
 
+# ── Fix 9b: Point systemd-timesyncd at headwaters.local ─────────────────────
+fix "Configure systemd-timesyncd to use headwaters.local as NTP server"
+mkdir -p "$MOUNT_DIR/etc/systemd/timesyncd.conf.d"
+cp "$SCRIPT_DIR/files/systemd/timesyncd.conf.d/10-trailcurrent.conf" \
+    "$MOUNT_DIR/etc/systemd/timesyncd.conf.d/10-trailcurrent.conf"
+
 # ── Fix 10: MaxAuthTries already in fix 6 sshd config ───────────────────────
 # (included in 10-trailcurrent.conf — MaxAuthTries 6)
 
@@ -250,6 +256,7 @@ verify /etc/ssh/ssh_host_rsa_key
 verify /etc/ssh/ssh_host_ecdsa_key
 verify /etc/ssh/sshd_config.d/10-trailcurrent.conf
 verify /etc/asound.conf
+verify /etc/systemd/timesyncd.conf.d/10-trailcurrent.conf
 verify /etc/modprobe.d/disable-wifi.conf
 verify /etc/systemd/system/power-save-hw.service
 verify /usr/local/bin/peregrine-self-test.sh

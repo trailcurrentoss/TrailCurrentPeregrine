@@ -343,6 +343,9 @@ function(
                 mkdir -p "$1/etc/systemd/system.conf.d"
                 install -m 644 "$STAGING/files/systemd/system.conf.d/timeout.conf" \
                     "$1/etc/systemd/system.conf.d/timeout.conf"
+                mkdir -p "$1/etc/systemd/timesyncd.conf.d"
+                install -m 644 "$STAGING/files/systemd/timesyncd.conf.d/10-trailcurrent.conf" \
+                    "$1/etc/systemd/timesyncd.conf.d/10-trailcurrent.conf"
             |||,
 
             // ════════════════════════════════════════════════════════════════

@@ -298,6 +298,25 @@ WAKE_THRESHOLD=0.7
 ```
 Then restart: `peregrine-restart`.
 
+### Clock is wrong / drifting
+**Cause:** The board has no RTC battery — every boot starts with whatever
+time the kernel hands it. `systemd-timesyncd` is configured to sync from
+`headwaters.local` (with `pool.ntp.org` as a fallback for bench/dev networks).
+**Check:**
+```bash
+timedatectl status                          # "System clock synchronized: yes"
+timedatectl show-timesync --all | head -20  # shows ServerName + last sync
+systemctl status systemd-timesyncd
+```
+If `ServerName=` is empty or stuck on the fallback when Headwaters is on the
+same LAN, mDNS resolution is the usual culprit:
+```bash
+getent hosts headwaters.local      # must return an IP via libnss-mdns
+avahi-resolve -n headwaters.local
+sudo systemctl restart systemd-timesyncd
+```
+The NTP server list lives in `/etc/systemd/timesyncd.conf.d/10-trailcurrent.conf`.
+
 ### Wake word never fires
 **Cause:** Threshold too high, or microphone is muted/at zero gain.
 **Check:**

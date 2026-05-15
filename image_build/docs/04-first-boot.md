@@ -15,6 +15,7 @@ state. Here's exactly what happens.
 | 90 s | Boot #2 | Plymouth splash again |
 | 110 s | All services up | `genie-server`, `voice-assistant`, `cpu-performance`, `power-save-hw` |
 | 130 s | mDNS announces | `peregrine.local` becomes resolvable |
+| 130 s | Time sync | `systemd-timesyncd` reaches `headwaters.local` (FallbackNTP `pool.ntp.org` if Headwaters is absent) |
 | 180 s | NPU LLM model loaded | Genie server is ready to serve |
 
 The wake-word model + STT load lazily on the first invocation, not at boot,

@@ -140,6 +140,16 @@ For TLS to a self-signed Headwaters broker, the CA cert is installed at
 page** (https://headwaters.local → Settings → CA Certificate panel). For
 the install/rotation procedure see [docs/mqtt-ca-cert.md](docs/mqtt-ca-cert.md).
 
+## Time sync
+
+The Q6A has no RTC battery, so the clock is set on every boot by
+`systemd-timesyncd`. The image ships with
+`/etc/systemd/timesyncd.conf.d/10-trailcurrent.conf` pointing at
+`headwaters.local` (resolved via mDNS through libnss-mdns + avahi). If
+Headwaters isn't reachable — bench/dev networks, vehicle off the LAN —
+timesyncd falls back to `pool.ntp.org`. Check sync status with
+`timedatectl status`.
+
 ## Voice Commands
 
 With MQTT connected, the assistant responds to:
