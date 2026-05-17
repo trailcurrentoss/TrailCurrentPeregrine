@@ -3,6 +3,15 @@
 # TrailCurrent Peregrine — Hardware self-test
 # Validates that the audio chain, NPU, and inference pipeline all work.
 # Safe to run any time. Exit code 0 if everything passes, non-zero otherwise.
+#
+# Modes:
+#   peregrine-self-test.sh             Full hardware + service self-test
+#   peregrine-self-test.sh --show-ca   Print the web-chat CA cert + SHA-256
+#                                      fingerprint, then exit. Used when an
+#                                      operator needs to install the CA on a
+#                                      client device. Requires shell access
+#                                      to the board (i.e. SSH credentials),
+#                                      so it's the gated bootstrap path.
 # ============================================================================
 
 set -uo pipefail
@@ -18,6 +27,36 @@ PEREGRINE_HOME="/home/trailcurrent"
 VENV="${PEREGRINE_HOME}/assistant-env"
 NPU_DIR="${PEREGRINE_HOME}/Llama3.2-1B-1024-v68"
 WAKE_MODEL="${PEREGRINE_HOME}/models/hey_peregrine.onnx"
+CA_PATH="${PEREGRINE_HOME}/certs/ca.pem"
+
+# ── Subcommand: print the CA cert + fingerprint and exit ────────────────────
+if [[ "${1:-}" == "--show-ca" || "${1:-}" == "show-ca" || "${1:-}" == "ca" ]]; then
+    if [[ ! -f "$CA_PATH" ]]; then
+        echo "ERROR: CA certificate not found at $CA_PATH" >&2
+        echo "       Run 'sudo peregrine-gen-certs.sh' to mint one." >&2
+        exit 1
+    fi
+    echo ""
+    echo -e "${BOLD}${GREEN}Trail${TEAL}Current${RESET} ${BOLD}Peregrine — Web UI CA Certificate${RESET}"
+    echo ""
+    echo -e "${BOLD}Subject:${RESET}"
+    openssl x509 -in "$CA_PATH" -noout -subject -issuer -dates \
+        | sed -E 's/^/  /'
+    echo ""
+    echo -e "${BOLD}SHA-256 fingerprint${RESET} (verify this on the install side):"
+    openssl x509 -in "$CA_PATH" -noout -fingerprint -sha256 \
+        | sed -E 's|.*=|  |'
+    echo ""
+    echo -e "${BOLD}PEM:${RESET}  (copy everything between BEGIN/END lines into a .pem file)"
+    echo ""
+    cat "$CA_PATH"
+    echo ""
+    echo -e "${BOLD}To install on a client:${RESET}"
+    echo "  scp trailcurrent@peregrine.local:${CA_PATH} ./peregrine-ca.pem"
+    echo "  # then import peregrine-ca.pem into your OS / browser trust store"
+    echo ""
+    exit 0
+fi
 
 PASS=0
 FAIL=0

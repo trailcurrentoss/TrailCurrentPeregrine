@@ -161,7 +161,7 @@ fi
 # ── 5. Application source ──────────────────────────────────────────────────
 step "5. Application source"
 
-for f in src/assistant.py src/genie_server.py; do
+for f in src/assistant.py src/genie_server.py src/web_chat.py scripts/generate-certs.sh; do
     if [ -f "${PROJECT_DIR}/${f}" ]; then
         ok "$f"
     else
@@ -172,7 +172,7 @@ done
 # ── 6. Service files ────────────────────────────────────────────────────────
 step "6. Service definitions"
 
-for f in config/voice-assistant.service config/genie-server.service; do
+for f in config/voice-assistant.service config/genie-server.service config/peregrine-chat.service; do
     if [ -f "${PROJECT_DIR}/${f}" ]; then
         if grep -q "User=trailcurrent" "${PROJECT_DIR}/${f}"; then
             ok "$f (User=trailcurrent)"

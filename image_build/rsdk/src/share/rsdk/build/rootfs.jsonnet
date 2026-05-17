@@ -307,6 +307,7 @@ function(
                 install -m 644 "$STAGING/src/assistant.py" "$1/home/trailcurrent/assistant.py"
                 install -m 644 "$STAGING/src/tts.py"       "$1/home/trailcurrent/tts.py"
                 install -m 644 "$STAGING/src/genie_server.py" "$1/home/trailcurrent/genie_server.py"
+                install -m 644 "$STAGING/src/web_chat.py"  "$1/home/trailcurrent/web_chat.py"
                 # On-disk Piper TTS cache dir (populated on first run)
                 install -d -o trailcurrent -g trailcurrent -m 755 \
                     "$1/home/trailcurrent/.cache/peregrine-tts"
@@ -334,6 +335,8 @@ function(
                     "$1/etc/systemd/system/voice-assistant.service"
                 install -m 644 "$STAGING/config/genie-server.service" \
                     "$1/etc/systemd/system/genie-server.service"
+                install -m 644 "$STAGING/config/peregrine-chat.service" \
+                    "$1/etc/systemd/system/peregrine-chat.service"
                 install -m 644 "$STAGING/files/systemd/cpu-performance.service" \
                     "$1/etc/systemd/system/cpu-performance.service"
                 install -m 644 "$STAGING/files/systemd/power-save-hw.service" \
@@ -361,6 +364,8 @@ function(
                     "$1/usr/local/bin/peregrine-first-login.sh"
                 install -m 755 "$STAGING/files/scripts/peregrine-self-test.sh" \
                     "$1/usr/local/bin/peregrine-self-test.sh"
+                install -m 755 "$STAGING/scripts/generate-certs.sh" \
+                    "$1/usr/local/sbin/peregrine-gen-certs.sh"
             |||,
 
             // ════════════════════════════════════════════════════════════════
@@ -389,6 +394,7 @@ function(
                 chroot "$1" systemctl enable \
                     genie-server.service \
                     voice-assistant.service \
+                    peregrine-chat.service \
                     cpu-performance.service \
                     power-save-hw.service \
                     peregrine-firstboot.service \
@@ -691,6 +697,7 @@ function(
                 check "$1" /home/trailcurrent/assistant.py
                 check "$1" /home/trailcurrent/tts.py
                 check "$1" /home/trailcurrent/genie_server.py
+                check "$1" /home/trailcurrent/web_chat.py
                 check "$1" /home/trailcurrent/assistant.env
                 check "$1" /home/trailcurrent/models/hey_peregrine.onnx
                 check_x "$1" /home/trailcurrent/Llama3.2-1B-1024-v68/genie-t2t-run
@@ -698,8 +705,10 @@ function(
                 check_x "$1" /home/trailcurrent/assistant-env/bin/python3
                 check "$1" /etc/systemd/system/voice-assistant.service
                 check "$1" /etc/systemd/system/genie-server.service
+                check "$1" /etc/systemd/system/peregrine-chat.service
                 check "$1" /etc/systemd/system/peregrine-firstboot.service
                 check_x "$1" /usr/local/sbin/peregrine-firstboot.sh
+                check_x "$1" /usr/local/sbin/peregrine-gen-certs.sh
                 check_x "$1" /usr/local/bin/peregrine-first-login.sh
                 check_x "$1" /usr/local/bin/peregrine-self-test.sh
                 check "$1" /usr/share/plymouth/themes/trailcurrent/trailcurrent.plymouth
@@ -730,7 +739,7 @@ function(
                     echo "  ✗ rsetup-config-first-boot still installed (will override SSH on first boot)"
                     FAIL=$((FAIL+1))
                 fi
-                for svc in genie-server voice-assistant cpu-performance power-save-hw peregrine-firstboot ssh; do
+                for svc in genie-server voice-assistant peregrine-chat cpu-performance power-save-hw peregrine-firstboot ssh; do
                     if chroot "$1" systemctl is-enabled "$svc" >/dev/null 2>&1; then
                         echo "  ✓ $svc enabled"
                     else

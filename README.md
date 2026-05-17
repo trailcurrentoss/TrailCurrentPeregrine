@@ -17,6 +17,12 @@ Entirely offline voice pipeline:
 3. **LLM** — Llama 3.2 1B on Hexagon NPU via `genie-t2t-run` (~12 tok/s)
 4. **Text-to-speech** — Piper TTS (`en_US-libritts_r-medium`)
 5. **Device control** — MQTT integration with TrailCurrent (lights, relays, sensors)
+6. **Web chat UI** — `https://peregrine.local/` exposes the same on-device LLM
+   to any browser on the LAN. TLS terminates inside `web_chat.py` using a
+   per-board self-signed certificate; port 80 redirects to 443 and also
+   serves `/ca.pem` unencrypted so first-time clients can install the CA
+   before completing a TLS handshake. The chat backend proxies to
+   `genie-server` on loopback.
 
 All processing happens on-device. No cloud services required for the core loop.
 
@@ -59,11 +65,14 @@ TrailCurrentPeregrine/
 │
 ├── src/
 │   ├── assistant.py                Main voice assistant loop
-│   └── genie_server.py             NPU LLM HTTP server
+│   ├── genie_server.py             NPU LLM HTTP server (loopback)
+│   ├── tts.py                      Piper TTS streaming helper
+│   └── web_chat.py                 LAN-facing chat UI (port 80, proxies genie)
 │
 ├── config/
 │   ├── voice-assistant.service     systemd unit (canonical, baked into image)
-│   └── genie-server.service        systemd unit (canonical, baked into image)
+│   ├── genie-server.service        systemd unit (canonical, baked into image)
+│   └── peregrine-chat.service      systemd unit for the web chat UI
 │
 ├── models/
 │   ├── hey_peregrine.onnx          Custom wake word model

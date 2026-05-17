@@ -56,52 +56,74 @@ SSH="ssh -o ControlPath=$SOCK"
 SSHT="ssh -t -o ControlPath=$SOCK"
 
 # ── 1. Refresh openwakeword (--no-deps; tflite-runtime has no aarch64 wheel) ─
-echo "[1/5] Refreshing openwakeword + timezonefinder..."
+echo "[1/6] Refreshing openwakeword + timezonefinder..."
 $SSH "$TARGET" "${REMOTE_HOME}/assistant-env/bin/pip install -q --force-reinstall --no-deps openwakeword 2>&1 | tail -1"
 $SSH "$TARGET" "${REMOTE_HOME}/assistant-env/bin/pip install -q timezonefinder 2>&1 | tail -1"
 
 # ── 2. assistant.py + tts.py ────────────────────────────────────────────────
-echo "[2/5] Copying assistant.py + tts.py..."
+echo "[2/6] Copying assistant.py + tts.py..."
 $SCP "${SCRIPT_DIR}/src/assistant.py" "${TARGET}:${REMOTE_HOME}/assistant.py"
 $SCP "${SCRIPT_DIR}/src/tts.py"        "${TARGET}:${REMOTE_HOME}/tts.py"
 
 # ── 3. genie_server.py ──────────────────────────────────────────────────────
-echo "[3/5] Copying genie_server.py..."
+echo "[3/6] Copying genie_server.py..."
 $SCP "${SCRIPT_DIR}/src/genie_server.py" "${TARGET}:${REMOTE_HOME}/genie_server.py"
 
-# ── 4. Wake-word model ──────────────────────────────────────────────────────
-echo "[4/5] Copying wake-word model..."
+# ── 4. web_chat.py + TLS cert gen script ────────────────────────────────────
+echo "[4/6] Copying web_chat.py + cert script..."
+$SCP "${SCRIPT_DIR}/src/web_chat.py" "${TARGET}:${REMOTE_HOME}/web_chat.py"
+$SCP "${SCRIPT_DIR}/scripts/generate-certs.sh" "${TARGET}:/tmp/peregrine-gen-certs.sh"
+$SSHT "$TARGET" "sudo install -m 755 /tmp/peregrine-gen-certs.sh /usr/local/sbin/peregrine-gen-certs.sh && \
+                 rm -f /tmp/peregrine-gen-certs.sh && \
+                 if [ ! -f ${REMOTE_HOME}/certs/server.crt ] || [ ! -f ${REMOTE_HOME}/certs/ca.pem ]; then \
+                     echo '  No TLS cert on board — minting now...' && \
+                     sudo PEREGRINE_HOSTNAME=peregrine.local /usr/local/sbin/peregrine-gen-certs.sh; \
+                 else \
+                     echo '  TLS cert already present — skipping cert mint'; \
+                 fi"
+
+# ── 5. Wake-word model ──────────────────────────────────────────────────────
+echo "[5/6] Copying wake-word model..."
 $SSH "$TARGET" "mkdir -p ${REMOTE_HOME}/models"
 $SCP "${SCRIPT_DIR}/models/hey_peregrine.onnx" "${TARGET}:${REMOTE_HOME}/models/hey_peregrine.onnx"
 if [ -f "${SCRIPT_DIR}/models/hey_peregrine.onnx.data" ]; then
     $SCP "${SCRIPT_DIR}/models/hey_peregrine.onnx.data" "${TARGET}:${REMOTE_HOME}/models/hey_peregrine.onnx.data"
 fi
 
-# ── 5. Service files ────────────────────────────────────────────────────────
-echo "[5/5] Copying service files..."
+# ── 6. Service files ────────────────────────────────────────────────────────
+echo "[6/6] Copying service files..."
 $SCP "${SCRIPT_DIR}/config/voice-assistant.service" "${TARGET}:/tmp/voice-assistant.service"
 $SCP "${SCRIPT_DIR}/config/genie-server.service"   "${TARGET}:/tmp/genie-server.service"
+$SCP "${SCRIPT_DIR}/config/peregrine-chat.service" "${TARGET}:/tmp/peregrine-chat.service"
 $SCP "${SCRIPT_DIR}/image_build/files/systemd/cpu-performance.service" \
      "${TARGET}:/tmp/cpu-performance.service"
 $SSHT "$TARGET" "sudo install -m 644 /tmp/voice-assistant.service /etc/systemd/system/voice-assistant.service && \
                  sudo install -m 644 /tmp/genie-server.service   /etc/systemd/system/genie-server.service && \
+                 sudo install -m 644 /tmp/peregrine-chat.service /etc/systemd/system/peregrine-chat.service && \
                  sudo install -m 644 /tmp/cpu-performance.service /etc/systemd/system/cpu-performance.service && \
-                 rm -f /tmp/voice-assistant.service /tmp/genie-server.service /tmp/cpu-performance.service && \
-                 sudo systemctl daemon-reload"
+                 rm -f /tmp/voice-assistant.service /tmp/genie-server.service /tmp/peregrine-chat.service /tmp/cpu-performance.service && \
+                 sudo systemctl daemon-reload && \
+                 sudo systemctl enable peregrine-chat.service"
 
 echo ""
 echo "Deploy complete. Files copied:"
 echo "  ${REMOTE_HOME}/assistant.py"
 echo "  ${REMOTE_HOME}/tts.py"
 echo "  ${REMOTE_HOME}/genie_server.py"
+echo "  ${REMOTE_HOME}/web_chat.py"
 echo "  ${REMOTE_HOME}/models/hey_peregrine.onnx"
 echo "  /etc/systemd/system/voice-assistant.service"
 echo "  /etc/systemd/system/genie-server.service"
+echo "  /etc/systemd/system/peregrine-chat.service"
 echo "  /etc/systemd/system/cpu-performance.service"
 echo ""
-echo "To restart the assistant:"
-echo "  ssh -t ${TARGET} sudo systemctl restart voice-assistant"
+echo "To restart services:"
+echo "  ssh -t ${TARGET} sudo systemctl restart genie-server voice-assistant peregrine-chat"
+echo ""
+echo "Open the chat UI:"
+echo "  http://peregrine.local/   (or http://<board-ip>/)"
 echo ""
 echo "To watch logs:"
 echo "  ssh -t ${TARGET} sudo journalctl -u voice-assistant -f"
+echo "  ssh -t ${TARGET} sudo journalctl -u peregrine-chat   -f"
 echo ""

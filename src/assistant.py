@@ -61,8 +61,14 @@ MQTT_CA_CERT = os.getenv("MQTT_CA_CERT", "")  # path to ca.pem for self-signed c
 MQTT_USE_TLS = os.getenv("MQTT_USE_TLS", "true").lower() in ("true", "1", "yes")
 
 BASE_SYSTEM_PROMPT = (
-    "You are Peregrine, voice assistant for TrailCurrent, a 100% open source Software Defined Vehicle platform "
-    "(community-developed; Waveshare/Espressif supply hardware only). "
+    # Identity is intentionally terse — a small 1B model will otherwise parrot
+    # the opening sentence of the system prompt as its "answer" when it can't
+    # find a direct response to a question. The explicit "do not introduce
+    # yourself" line discourages that. The marketing description of TrailCurrent
+    # was removed because the model latched onto it as filler.
+    "You are Peregrine, a voice assistant for a vehicle control system. "
+    "Answer the user's question directly. Do not introduce yourself or "
+    "describe your role unless explicitly asked who you are. "
     "Give short plain-speech answers. "
     "Device control: output only {\"action\":\"light\",\"id\":\"all\",\"state\":1} "
     "or {\"action\":\"light\",\"id\":\"1\",\"brightness\":50} — no other text. "
@@ -817,8 +823,30 @@ def get_sensor_summary():
     return "Current sensor readings:\n" + "\n".join(lines)
 
 
+# The on-device LLM (Llama3.2-1B-1024-v68) has a hard 1024-token context.
+# Budget breakdown: 150 tokens reserved for response (num_predict), ~80 tokens
+# for chat-template wrapping + a typical voice question, leaving ~794 tokens
+# for the system prompt. JSON-heavy content (the device-control schema in
+# BASE_SYSTEM_PROMPT) tokenizes around 3 chars/token rather than the usual
+# 4, so a 2200-char cap maps to ~730 tokens — tight but safely under budget.
+# If this is exceeded Genie returns status=4 ("Context Size was exceeded"),
+# genie_server now traps that and returns a spoken-friendly apology rather
+# than the silent socket close that previously made every long question fail.
+_SYSTEM_PROMPT_BUDGET_CHARS = 2200
+_last_system_prompt_size = None
+
+
 def get_system_prompt():
-    """Build the full system prompt with current sensor data and device registry."""
+    """Build the full system prompt with current sensor data and device registry.
+
+    Capped to ``_SYSTEM_PROMPT_BUDGET_CHARS`` total. Dynamic sections (sensor
+    summary, device registry, playbills) are appended only while there is
+    remaining budget; the device / playbill lists are truncated to fit rather
+    than being included partially-mangled. BASE_SYSTEM_PROMPT is always kept
+    in full since the device-control JSON spec is what makes the model usable.
+    """
+    global _last_system_prompt_size
+
     if not MQTT_BROKER:
         return (
             "You are a helpful voice assistant. Keep answers concise and conversational, "
@@ -826,21 +854,43 @@ def get_system_prompt():
             "since your response will be spoken aloud."
         )
 
-    prompt = BASE_SYSTEM_PROMPT
-    prompt += get_sensor_summary()
+    parts = [BASE_SYSTEM_PROMPT]
+    remaining = _SYSTEM_PROMPT_BUDGET_CHARS - len(BASE_SYSTEM_PROMPT)
 
-    # Append device registry so the LLM knows device names and types
+    def _try_append(text):
+        nonlocal remaining
+        if remaining <= 0 or not text:
+            return False
+        if len(text) <= remaining:
+            parts.append(text)
+            remaining -= len(text)
+            return True
+        return False
+
+    _try_append(get_sensor_summary())
+
     if _device_registry:
-        prompt += "\n\nConnected devices:\n"
-        for key, info in sorted(_device_registry.items(), key=lambda x: x[1]["id"]):
-            prompt += f"- ID {info['id']}: \"{info['name']}\" (type: {info['type']})\n"
-        prompt += (
+        header = "\n\nConnected devices:\n"
+        footer = (
             "Use the device name in responses. "
             "Only lights support brightness. Relays and other devices are on/off only.\n"
         )
+        device_lines = [
+            f"- ID {info['id']}: \"{info['name']}\" (type: {info['type']})\n"
+            for _, info in sorted(_device_registry.items(), key=lambda x: x[1]["id"])
+        ]
+        # Drop lowest-priority lines (end of list) until header+lines+footer fits.
+        block = header + "".join(device_lines) + footer
+        while device_lines and len(block) > remaining:
+            device_lines.pop()
+            block = header + "".join(device_lines) + footer
+        if device_lines:
+            _try_append(block)
 
     if _playbill_devices:
-        prompt += "\nPlaybills (entertainment nodes):\n"
+        header = "\nPlaybills (entertainment nodes):\n"
+        footer = "Pass the Playbill name verbatim as the \"playbill\" field.\n"
+        playbill_lines = []
         for slug, info in sorted(_playbill_devices.items()):
             line = f"- \"{info['name']}\""
             if not info["online"]:
@@ -851,9 +901,21 @@ def get_system_prompt():
                 bits = [b for b in (radio, vol) if b]
                 if bits:
                     line += ": " + ", ".join(bits)
-            prompt += line + "\n"
-        prompt += "Pass the Playbill name verbatim as the \"playbill\" field.\n"
+            playbill_lines.append(line + "\n")
+        block = header + "".join(playbill_lines) + footer
+        while playbill_lines and len(block) > remaining:
+            playbill_lines.pop()
+            block = header + "".join(playbill_lines) + footer
+        if playbill_lines:
+            _try_append(block)
 
+    prompt = "".join(parts)
+    # Log when prompt size crosses a new high-water mark, so prompt bloat is
+    # observable in the journal without being noisy on every query.
+    if _last_system_prompt_size is None or len(prompt) > _last_system_prompt_size:
+        print(f"  System prompt: {len(prompt)} chars "
+              f"(~{len(prompt)//4} tokens, budget {_SYSTEM_PROMPT_BUDGET_CHARS})")
+        _last_system_prompt_size = len(prompt)
     return prompt
 
 
@@ -2288,9 +2350,20 @@ _ELEVATION_PATTERNS = [
     re.compile(r"\b(?:elevation|altitude)\b", re.I),
     re.compile(r"\bhow\s+high\s+(?:up\s+)?(?:am\s+i|are\s+we)\b", re.I),
 ]
+# Heading patterns require an interrogative or possessive qualifier — bare
+# "heading" / "course" / "bearing" / "direction" are far too ambiguous in
+# casual speech ("we're heading up for a hike", "of course", "in the
+# direction of the lake") and previously triggered a false-positive compass
+# answer for any sentence that contained one of those words.
 _HEADING_PATTERNS = [
-    re.compile(r"\b(?:heading|course|bearing|direction)\b", re.I),
-    re.compile(r"\bwhat\s+(?:direction|way)\s+(?:am\s+i|are\s+we)\b", re.I),
+    re.compile(
+        r"\b(?:what(?:'s|s|\s+is)?|which)\s+"
+        r"(?:(?:our|the|my|current)\s+)?(?:compass\s+)?"
+        r"(?:heading|bearing|course)\b",
+        re.I,
+    ),
+    re.compile(r"\b(?:current|compass)\s+(?:heading|bearing|course)\b", re.I),
+    re.compile(r"\bwhat\s+(?:direction|way)\s+(?:am\s+i|are\s+we|is)\b", re.I),
     re.compile(r"\bwhich\s+(?:direction|way)\b", re.I),
 ]
 _SPEED_PATTERNS = [
@@ -2820,7 +2893,15 @@ def match_intent(text):
             print("  Intent: heading query")
             details = sensor_data.get("local/gps/details")
             if details and details.get("courseOverGround") is not None:
-                deg = details["courseOverGround"]
+                raw = details["courseOverGround"]
+                # GPS course over ground is 0–360°. Some publishers emit the
+                # raw NMEA field × 10 (e.g. 230.2° becomes 2302). Defensively
+                # rescale anything well outside the expected range so we never
+                # say "heading southeast at 2302 degrees."
+                deg = raw / 10.0 if abs(raw) > 360 else raw
+                deg = deg % 360
+                if abs(raw) > 360:
+                    print(f"  Heading: rescaled raw={raw} -> {deg:.1f}°")
                 cardinal = _degrees_to_cardinal(deg)
                 return f"We're heading {cardinal} at {deg:.0f} degrees."
             return "I don't have heading data right now."
@@ -3185,6 +3266,11 @@ _INSTRUCTION_LEAK_RE = re.compile(
     r'give short|plain[- ]?speech|plain[- ]?spoken|short plain|'
     r'device control|output only|no other text|'
     r'other instructions|these instructions|the instructions|following instructions|'
+    # Identity-echo: model regurgitating "You are Peregrine..." as "I'm Peregrine..."
+    # in response to a question that has nothing to do with identity.
+    r"\bi('?m| am) peregrine\b|"
+    r'voice assistant for (a |the )?(vehicle|trailcurrent|rv)|'
+    r'software defined vehicle|trailcurrent platform|'
     r'\b0\s?=\s?off\b|\b1\s?=\s?on\b|'
     r'"?action"?\s*[:=]|"?state"?\s*[:=]|"?brightness"?\s*[:=]|'
     r'\{\s*"action"|\{"[a-z_]+"\s*:|'
@@ -3220,8 +3306,18 @@ def _is_leak_or_meta(text):
     return False
 
 
-def _clean_llm_response(text):
-    """Strip meta-commentary and leaked system-prompt instructions from LLM output."""
+def _normalize_for_echo_check(text):
+    """Lower-case, strip punctuation/whitespace for echo-match comparisons."""
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _clean_llm_response(text, user_prompt=None):
+    """Strip meta-commentary and leaked system-prompt instructions from LLM output.
+
+    If ``user_prompt`` is provided, also drop a leading sentence that simply
+    echoes the question (small models occasionally restate the prompt before
+    answering it).
+    """
     lines = text.split('\n')
     cleaned = []
     for line in lines:
@@ -3229,7 +3325,14 @@ def _clean_llm_response(text):
         if _META_START_RE.match(stripped) or _INSTRUCTION_LEAK_RE.search(stripped):
             break
         cleaned.append(line)
-    return '\n'.join(cleaned).strip() or text.strip()
+    result = '\n'.join(cleaned).strip()
+    if user_prompt and result:
+        norm_prompt = _normalize_for_echo_check(user_prompt)
+        # Look for an opening sentence (up to first . ! ?) that matches the prompt.
+        m = re.match(r"\s*([^.!?]+[.!?])\s*", result)
+        if m and _normalize_for_echo_check(m.group(1)) == norm_prompt:
+            result = result[m.end():].strip()
+    return result or text.strip()
 
 
 def ask_llm(prompt):
@@ -3242,13 +3345,13 @@ def ask_llm(prompt):
             "stream": False,
             "keep_alive": "30m",
             "options": {
-                "num_predict": 200,
+                "num_predict": 150,
                 "num_thread": _CPU_THREADS,
             }
         }, timeout=60)
         resp.raise_for_status()
         raw = resp.json().get("response", "Sorry, I didn't get a response.")
-        return _clean_llm_response(raw)
+        return _clean_llm_response(raw, user_prompt=prompt)
     except requests.exceptions.ConnectionError:
         return "Sorry, the language model is not running."
     except requests.exceptions.Timeout:
@@ -3268,6 +3371,11 @@ def ask_llm_stream(prompt):
     everything before invoking handle_command.
     """
     resp = None
+    # Small models sometimes open their reply by echoing the user's question
+    # verbatim before answering. Track whether we've yielded any real content
+    # yet so we can suppress an echo as the first sentence.
+    first_sentence_yielded = False
+    norm_prompt = _normalize_for_echo_check(prompt)
     try:
         resp = requests.post(f"{OLLAMA_URL}/api/generate", json={
             "model": OLLAMA_MODEL,
@@ -3276,7 +3384,7 @@ def ask_llm_stream(prompt):
             "stream": True,
             "keep_alive": "30m",
             "options": {
-                "num_predict": 200,
+                "num_predict": 150,
                 "num_thread": _CPU_THREADS,
             }
         }, timeout=60, stream=True)
@@ -3310,12 +3418,22 @@ def ask_llm_stream(prompt):
                         break
                     if _is_leak_or_meta(sentence):
                         return
+                    if (not first_sentence_yielded
+                            and _normalize_for_echo_check(sentence) == norm_prompt):
+                        # First-sentence echo of the user's question — drop it
+                        # silently and keep waiting for the real answer.
+                        continue
+                    first_sentence_yielded = True
                     yield sentence
             if obj.get("done"):
                 break
         remainder = buffer.strip()
         if remainder and not _is_leak_or_meta(remainder):
-            yield remainder
+            if (not first_sentence_yielded
+                    and _normalize_for_echo_check(remainder) == norm_prompt):
+                pass  # drop trailing echo if nothing real was emitted
+            else:
+                yield remainder
     except requests.exceptions.ConnectionError:
         yield "Sorry, the language model is not running."
     except requests.exceptions.Timeout:

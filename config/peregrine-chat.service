@@ -1,0 +1,43 @@
+[Unit]
+Description=Peregrine Web Chat (LAN-facing UI for the on-device LLM)
+After=network-online.target genie-server.service
+Wants=network-online.target genie-server.service
+
+[Service]
+Type=simple
+User=trailcurrent
+Group=trailcurrent
+WorkingDirectory=/home/trailcurrent
+ExecStart=/usr/bin/python3 /home/trailcurrent/web_chat.py
+Restart=on-failure
+RestartSec=3
+
+Environment=PYTHONUNBUFFERED=1
+Environment=WEB_CHAT_HOST=0.0.0.0
+Environment=WEB_CHAT_HTTPS_PORT=443
+Environment=WEB_CHAT_HTTP_PORT=80
+Environment=WEB_CHAT_PUBLIC_HOSTNAME=peregrine.local
+Environment=WEB_CHAT_TLS_CERT=/home/trailcurrent/certs/server.crt
+Environment=WEB_CHAT_TLS_KEY=/home/trailcurrent/certs/server.key
+Environment=WEB_CHAT_CA_PATH=/home/trailcurrent/certs/ca.pem
+Environment=GENIE_URL=http://127.0.0.1:11434
+
+# Allow binding privileged ports 80 + 443 without running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# Stdlib-only Python service — safe to harden. The certs directory is read
+# during startup; we don't need to write to it from this service.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

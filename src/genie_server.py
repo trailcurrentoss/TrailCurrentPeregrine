@@ -111,6 +111,37 @@ def build_prompt(system: str, user_prompt: str) -> str:
     return "".join(parts)
 
 
+def build_chat_prompt(messages: list, system: str = "") -> str:
+    """Format a multi-turn chat history into the Llama 3.2 chat template.
+
+    ``messages`` is a list of ``{"role": "system"|"user"|"assistant",
+    "content": str}`` dicts (Ollama / OpenAI convention). A top-level ``system``
+    string, if provided, takes precedence over any system role in the list and
+    is emitted first.
+    """
+    parts = ["<|begin_of_text|>"]
+    sys_text = system
+    if not sys_text:
+        for m in messages:
+            if m.get("role") == "system" and m.get("content"):
+                sys_text = m["content"]
+                break
+    if sys_text:
+        parts.append(
+            f"<|start_header_id|>system<|end_header_id|>\n\n{sys_text}<|eot_id|>"
+        )
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content", "")
+        if role not in ("user", "assistant") or not content:
+            continue
+        parts.append(
+            f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
+        )
+    parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
+    return "".join(parts)
+
+
 # ============================================================================
 # Persistent path: ctypes wrapper around libGenie.so
 # ============================================================================
@@ -423,6 +454,8 @@ class GenieHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/generate":
             self._handle_generate()
+        elif self.path == "/api/chat":
+            self._handle_chat()
         else:
             self.send_error(404)
 
@@ -456,12 +489,47 @@ class GenieHandler(BaseHTTPRequestHandler):
         else:
             self._unary_generate(prompt)
 
+    def _handle_chat(self):
+        """Multi-turn variant of /api/generate. Accepts a ``messages`` list."""
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length)) if length else {}
+
+        messages = body.get("messages") or []
+        if not isinstance(messages, list) or not messages:
+            self.send_error(400, "missing messages")
+            return
+
+        prompt = build_chat_prompt(messages, body.get("system", ""))
+        if body.get("stream"):
+            self._stream_generate(prompt)
+        else:
+            self._unary_generate(prompt)
+
     def _unary_generate(self, prompt):
-        response_text, duration = run_genie(prompt)
+        # Catch GenieDialog_query failures (notably status=4 "context size
+        # exceeded") so the HTTP handler always sends a real JSON response.
+        # Without this, the runtime error escapes BaseHTTPRequestHandler and
+        # the client sees an unceremoniously closed socket — assistant.py
+        # then hears empty stream and speaks "Sorry, I didn't get a response."
+        # The caller can't distinguish that from a model truly returning ""
+        # so we surface a short, spoken-friendly explanation here instead.
+        try:
+            response_text, duration = run_genie(prompt)
+            error_msg = ""
+        except RuntimeError as e:
+            response_text, duration = "", 0.0
+            error_msg = str(e)
+            print(f"[genie-server] generate failed: {error_msg}")
+
+        if error_msg and "status=4" in error_msg:
+            response_text = ("Sorry, that question was too long for me to "
+                             "answer on-device. Try something shorter.")
+        elif not response_text:
+            response_text = "Sorry, I didn't get a response."
 
         reply = {
             "model": "llama3.2:1b-npu",
-            "response": response_text or "Sorry, I didn't get a response.",
+            "response": response_text,
             "done": True,
             "total_duration": int(duration * 1e9),
         }
@@ -481,25 +549,49 @@ class GenieHandler(BaseHTTPRequestHandler):
 
         start = time.monotonic()
         try:
-            for text, done in run_genie_stream(prompt):
-                if done:
-                    final = {
+            try:
+                for text, done in run_genie_stream(prompt):
+                    if done:
+                        final = {
+                            "model": "llama3.2:1b-npu",
+                            "response": "",
+                            "done": True,
+                            "total_duration": int((time.monotonic() - start) * 1e9),
+                        }
+                        self.wfile.write((json.dumps(final) + "\n").encode())
+                        self.wfile.flush()
+                        return
+                    if not text:
+                        continue
+                    chunk = {
                         "model": "llama3.2:1b-npu",
-                        "response": "",
-                        "done": True,
-                        "total_duration": int((time.monotonic() - start) * 1e9),
+                        "response": text,
+                        "done": False,
                     }
-                    self.wfile.write((json.dumps(final) + "\n").encode())
+                    self.wfile.write((json.dumps(chunk) + "\n").encode())
                     self.wfile.flush()
-                    return
-                if not text:
-                    continue
-                chunk = {
+            except RuntimeError as e:
+                # GenieDialog_query failed (e.g. context exceeded). Emit a final
+                # NDJSON line so the client receives a structured signal instead
+                # of a silent socket close.
+                err = str(e)
+                print(f"[genie-server] stream failed: {err}")
+                if "status=4" in err:
+                    msg = ("Sorry, that question was too long for me to answer "
+                           "on-device. Try something shorter.")
+                else:
+                    msg = "Sorry, I didn't get a response."
+                self.wfile.write((json.dumps({
                     "model": "llama3.2:1b-npu",
-                    "response": text,
+                    "response": msg,
                     "done": False,
-                }
-                self.wfile.write((json.dumps(chunk) + "\n").encode())
+                }) + "\n").encode())
+                self.wfile.write((json.dumps({
+                    "model": "llama3.2:1b-npu",
+                    "response": "",
+                    "done": True,
+                    "total_duration": int((time.monotonic() - start) * 1e9),
+                }) + "\n").encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             # Client disconnected mid-stream — drop the stream.

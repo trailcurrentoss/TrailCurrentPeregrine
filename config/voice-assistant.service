@@ -18,6 +18,15 @@ Environment=HOME=/home/trailcurrent
 Environment=WAKE_MODEL_PATH=/home/trailcurrent/models/hey_peregrine.onnx
 Environment=PATH=/home/trailcurrent/assistant-env/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
+# Hard-disable HuggingFace Hub network calls — faster-whisper depends on
+# huggingface_hub, which by default phones home on import to check model
+# revisions. Peregrine is fully offline; the Whisper weights ship in the
+# image cache and never need to be (re)fetched.
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=HF_DATASETS_OFFLINE=1
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+Environment=HF_HUB_DISABLE_IMPLICIT_TOKEN=1
 # Site-specific config (MQTT, thresholds, etc.) — never overwritten by deploys.
 EnvironmentFile=-/home/trailcurrent/assistant.env
 

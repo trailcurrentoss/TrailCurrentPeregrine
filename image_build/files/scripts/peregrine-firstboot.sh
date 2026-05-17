@@ -44,7 +44,22 @@ else
     log "WARNING: Could not determine root disk for expansion"
 fi
 
-# 4. Mark complete and disable this service
+# 4. Mint a per-board TLS certificate for the web chat UI.
+#    Each board gets its own CA + server cert. Devices that have trusted one
+#    Peregrine only trust that specific board, not the whole product line.
+if [[ -x /usr/local/sbin/peregrine-gen-certs.sh ]]; then
+    log "Minting self-signed TLS certificate for the web UI..."
+    if PEREGRINE_HOSTNAME="peregrine.local" \
+       /usr/local/sbin/peregrine-gen-certs.sh; then
+        log "TLS certificate ready."
+    else
+        log "WARNING: TLS cert generation failed — web UI will fall back to HTTP."
+    fi
+else
+    log "WARNING: peregrine-gen-certs.sh not installed — skipping TLS cert mint."
+fi
+
+# 5. Mark complete and disable this service
 touch /var/lib/peregrine/.firstboot-done
 systemctl disable peregrine-firstboot.service 2>/dev/null || true
 log "First-boot complete — service disabled. No reboot needed."
