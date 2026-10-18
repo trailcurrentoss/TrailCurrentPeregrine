@@ -43,9 +43,21 @@ that `voice-assistant.service` already uses.
 
 ## Security model
 
-- Plain HTTP, not HTTPS. The endpoint is intended for LAN-only clients that
-  can't practically ship the self-signed CA the browser UI uses. Trust
-  boundary is "already on the LAN with the LLM box".
+`POST /api/voice` is served on two listeners:
+
+- **HTTPS (`WEB_CHAT_HTTPS_PORT`, 443) — the default path.** Same listener
+  and same trust as `/api/chat`: the client is on the LAN and trusts
+  Peregrine's CA. No token. Headwaters hands its Peregrine URL and CA to
+  devices such as Tiercel, so nothing extra is provisioned. Only offered
+  when TLS is enabled.
+- **Plain HTTP (`PEREGRINE_VOICE_PORT`, 8081) — legacy.** For terminals
+  that can't verify the CA. Because it has no TLS, it is gated by the bearer
+  token below and stays closed when no token is set.
+
+The rest of this section applies to the plain-HTTP listener.
+
+- Plain HTTP, not HTTPS. Trust boundary is "already on the LAN with the LLM
+  box" plus the token.
 - Bearer token required on every request. When `PEREGRINE_VOICE_TOKEN` is
   empty the endpoint stays closed (`[voice] endpoint disabled` in the
   journal) — that's the safe default.

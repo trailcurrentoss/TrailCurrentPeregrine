@@ -771,169 +771,6 @@ form.addEventListener("submit", async (e) => {
 """
 
 
-# --- HTTP handler ---
-
-class ChatHandler(BaseHTTPRequestHandler):
-    server_version = "PeregrineChat/1.0"
-
-    def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            self._serve_html()
-        elif self.path == "/healthz":
-            self._serve_json({"status": "ok", "tls": TLS_ENABLED})
-        else:
-            self.send_error(404)
-
-    def do_POST(self):
-        if self.path == "/api/chat":
-            self._handle_chat()
-        else:
-            self.send_error(404)
-
-    # ---- handlers ----
-
-    def _serve_html(self):
-        body = CHAT_HTML.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _serve_json(self, obj, status=200):
-        body = json.dumps(obj).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _handle_chat(self):
-        length = int(self.headers.get("Content-Length", 0))
-        try:
-            body = json.loads(self.rfile.read(length)) if length else {}
-        except json.JSONDecodeError:
-            self._serve_json({"error": "invalid JSON"}, status=400)
-            return
-
-        messages = body.get("messages") or []
-        if not isinstance(messages, list) or not messages:
-            self._serve_json({"error": "missing messages"}, status=400)
-            return
-
-        system_prompt = body.get("system") or DEFAULT_SYSTEM_PROMPT
-        trimmed = _trim_messages(messages, system_prompt)
-        if not trimmed:
-            self._serve_json({"error": "no usable messages"}, status=400)
-            return
-
-        # Start SSE stream. Force connection close so mobile browsers (notably
-        # Firefox mobile) drop their fetch ReadableStream buffer promptly when
-        # the model finishes — they otherwise hang on the open socket and the
-        # UI shows a stuck blinking cursor after the response is complete.
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
-        # Disable proxy buffering, in case anyone fronts this later.
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        self.close_connection = True
-
-        try:
-            # Try the intent RPC first — the same fast-path the voice loop uses.
-            # If it matches, we're done (no LLM call). Otherwise fall through
-            # to the LLM and, if the LLM emits a JSON control command, feed it
-            # to the RPC /api/command endpoint so lights actually turn on.
-            latest_user = _latest_user_text(trimmed)
-            if latest_user:
-                canned = _intent_lookup(latest_user)
-                if canned:
-                    self._send_sse({"delta": canned})
-                    self._send_sse({"done": True})
-                    self._send_sse_raw("data: [DONE]\n\n")
-                    return
-                # Not a canned answer — see if the message references "here" /
-                # "this area" / etc. and needs a location fact injected before
-                # the LLM sees it. Rewrites only the newest user turn.
-                enriched = _enrich_text(latest_user)
-                if enriched != latest_user:
-                    trimmed = _replace_last_user(trimmed, enriched)
-            self._proxy_genie_stream(trimmed, system_prompt)
-        except (BrokenPipeError, ConnectionResetError):
-            return
-
-    def _proxy_genie_stream(self, messages, system_prompt):
-        """Stream tokens from genie-server's /api/chat and forward as SSE.
-
-        Watches the first non-whitespace character of the stream — if it's
-        ``{`` the model is emitting a device-control JSON command, which the
-        UI shouldn't show verbatim. We buffer the whole response, hand it to
-        the intent RPC's /api/command endpoint (same code path the voice loop
-        uses), and stream back the resulting spoken confirmation instead.
-        """
-        payload = json.dumps({
-            "messages": messages,
-            "system": system_prompt,
-            "stream": True,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            GENIE_URL.rstrip("/") + "/api/chat",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        buffered = []          # holds full response when we suspect JSON
-        looks_like_json = None # None until we see first non-whitespace char
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                for raw in resp:
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    try:
-                        evt = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if evt.get("done"):
-                        if looks_like_json:
-                            full = "".join(buffered)
-                            confirmation = _command_execute(full)
-                            reply = confirmation or "Sorry, I couldn't do that."
-                            self._send_sse({"delta": reply})
-                        self._send_sse({"done": True})
-                        self._send_sse_raw("data: [DONE]\n\n")
-                        return
-                    delta = evt.get("response") or ""
-                    if not delta:
-                        continue
-                    if looks_like_json is None:
-                        stripped = delta.lstrip()
-                        if stripped:
-                            looks_like_json = stripped.startswith("{")
-                    if looks_like_json:
-                        buffered.append(delta)
-                    else:
-                        self._send_sse({"delta": delta})
-        except urllib.error.URLError as e:
-            self._send_sse({"error": f"NPU backend unavailable: {e.reason}"})
-            self._send_sse_raw("data: [DONE]\n\n")
-
-    def _send_sse(self, obj):
-        self._send_sse_raw("data: " + json.dumps(obj) + "\n\n")
-
-    def _send_sse_raw(self, frame):
-        self.wfile.write(frame.encode("utf-8"))
-        self.wfile.flush()
-
-    def log_message(self, format, *args):
-        sys.stdout.write(
-            "[web-chat] %s - %s\n" % (self.address_string(), format % args)
-        )
-        sys.stdout.flush()
-
-
 def _get_engines():
     """Return (stt_engine, tts_engine), loading them once per process."""
     global _stt_engine, _tts_engine
@@ -1251,25 +1088,20 @@ def _voice_llm_reply(text: str) -> str:
     return reply
 
 
-class VoiceHandler(BaseHTTPRequestHandler):
-    """Bearer-token gated voice endpoint for the ESP32 P4 terminal."""
+class VoiceMixin:
+    """POST /api/voice, shared by both listeners that serve it.
 
-    server_version = "PeregrineVoice/1.0"
-    protocol_version = "HTTP/1.1"
+    - The HTTPS listener (ChatHandler) serves it with the same trust as
+      /api/chat: the client is on the LAN and trusts Peregrine's CA. That is
+      all a voice terminal needs — the URL and CA Headwaters already holds
+      for Overlook's chat — so Headwaters hands both to devices like
+      Tiercel and nothing else has to be provisioned.
+    - The plain-HTTP listener (VoiceHandler, PEREGRINE_VOICE_PORT) has no
+      TLS, so it keeps the bearer token. It stays for terminals that predate
+      the HTTPS path.
+    """
 
-    def do_GET(self):
-        if self.path == "/healthz":
-            self._json({"ok": True, "voice_enabled": VOICE_ENABLED})
-            return
-        self._json({"error": "not found"}, status=404)
-
-    def do_POST(self):
-        if self.path != "/api/voice":
-            self._json({"error": "not found"}, status=404)
-            return
-        if not self._auth_ok():
-            self._json({"error": "unauthorized"}, status=401)
-            return
+    def _handle_voice(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
         if length <= 0:
             self._json({"error": "missing Content-Length"}, status=411)
@@ -1451,15 +1283,6 @@ class VoiceHandler(BaseHTTPRequestHandler):
                   f"({bytes_streamed/(VOICE_TARGET_SR*2):.1f}s of audio)",
                   file=sys.stderr)
 
-    def _auth_ok(self) -> bool:
-        if not VOICE_TOKEN:
-            return False
-        header = self.headers.get("Authorization", "")
-        prefix = "Bearer "
-        if not header.startswith(prefix):
-            return False
-        return hmac.compare_digest(header[len(prefix):], VOICE_TOKEN)
-
     def _json(self, obj, status=200):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
@@ -1468,6 +1291,204 @@ class VoiceHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+
+# --- HTTP handler ---
+
+class ChatHandler(VoiceMixin, BaseHTTPRequestHandler):
+    server_version = "PeregrineChat/1.0"
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._serve_html()
+        elif self.path == "/healthz":
+            self._serve_json({"status": "ok", "tls": TLS_ENABLED})
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/api/chat":
+            self._handle_chat()
+        elif self.path == "/api/voice" and TLS_ENABLED:
+            # Same trust as /api/chat: no token on the TLS listener. Not
+            # offered on the plain-HTTP fallback, where it would be open.
+            self._handle_voice()
+        else:
+            self.send_error(404)
+
+    # ---- handlers ----
+
+    def _serve_html(self):
+        body = CHAT_HTML.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_json(self, obj, status=200):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_chat(self):
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            body = json.loads(self.rfile.read(length)) if length else {}
+        except json.JSONDecodeError:
+            self._serve_json({"error": "invalid JSON"}, status=400)
+            return
+
+        messages = body.get("messages") or []
+        if not isinstance(messages, list) or not messages:
+            self._serve_json({"error": "missing messages"}, status=400)
+            return
+
+        system_prompt = body.get("system") or DEFAULT_SYSTEM_PROMPT
+        trimmed = _trim_messages(messages, system_prompt)
+        if not trimmed:
+            self._serve_json({"error": "no usable messages"}, status=400)
+            return
+
+        # Start SSE stream. Force connection close so mobile browsers (notably
+        # Firefox mobile) drop their fetch ReadableStream buffer promptly when
+        # the model finishes — they otherwise hang on the open socket and the
+        # UI shows a stuck blinking cursor after the response is complete.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        # Disable proxy buffering, in case anyone fronts this later.
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+
+        try:
+            # Try the intent RPC first — the same fast-path the voice loop uses.
+            # If it matches, we're done (no LLM call). Otherwise fall through
+            # to the LLM and, if the LLM emits a JSON control command, feed it
+            # to the RPC /api/command endpoint so lights actually turn on.
+            latest_user = _latest_user_text(trimmed)
+            if latest_user:
+                canned = _intent_lookup(latest_user)
+                if canned:
+                    self._send_sse({"delta": canned})
+                    self._send_sse({"done": True})
+                    self._send_sse_raw("data: [DONE]\n\n")
+                    return
+                # Not a canned answer — see if the message references "here" /
+                # "this area" / etc. and needs a location fact injected before
+                # the LLM sees it. Rewrites only the newest user turn.
+                enriched = _enrich_text(latest_user)
+                if enriched != latest_user:
+                    trimmed = _replace_last_user(trimmed, enriched)
+            self._proxy_genie_stream(trimmed, system_prompt)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def _proxy_genie_stream(self, messages, system_prompt):
+        """Stream tokens from genie-server's /api/chat and forward as SSE.
+
+        Watches the first non-whitespace character of the stream — if it's
+        ``{`` the model is emitting a device-control JSON command, which the
+        UI shouldn't show verbatim. We buffer the whole response, hand it to
+        the intent RPC's /api/command endpoint (same code path the voice loop
+        uses), and stream back the resulting spoken confirmation instead.
+        """
+        payload = json.dumps({
+            "messages": messages,
+            "system": system_prompt,
+            "stream": True,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            GENIE_URL.rstrip("/") + "/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        buffered = []          # holds full response when we suspect JSON
+        looks_like_json = None # None until we see first non-whitespace char
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                for raw in resp:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if evt.get("done"):
+                        if looks_like_json:
+                            full = "".join(buffered)
+                            confirmation = _command_execute(full)
+                            reply = confirmation or "Sorry, I couldn't do that."
+                            self._send_sse({"delta": reply})
+                        self._send_sse({"done": True})
+                        self._send_sse_raw("data: [DONE]\n\n")
+                        return
+                    delta = evt.get("response") or ""
+                    if not delta:
+                        continue
+                    if looks_like_json is None:
+                        stripped = delta.lstrip()
+                        if stripped:
+                            looks_like_json = stripped.startswith("{")
+                    if looks_like_json:
+                        buffered.append(delta)
+                    else:
+                        self._send_sse({"delta": delta})
+        except urllib.error.URLError as e:
+            self._send_sse({"error": f"NPU backend unavailable: {e.reason}"})
+            self._send_sse_raw("data: [DONE]\n\n")
+
+    def _send_sse(self, obj):
+        self._send_sse_raw("data: " + json.dumps(obj) + "\n\n")
+
+    def _send_sse_raw(self, frame):
+        self.wfile.write(frame.encode("utf-8"))
+        self.wfile.flush()
+
+    def log_message(self, format, *args):
+        sys.stdout.write(
+            "[web-chat] %s - %s\n" % (self.address_string(), format % args)
+        )
+        sys.stdout.flush()
+
+
+class VoiceHandler(VoiceMixin, BaseHTTPRequestHandler):
+    """Bearer-token gated voice endpoint on the plain-HTTP voice port."""
+
+    server_version = "PeregrineVoice/1.0"
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            self._json({"ok": True, "voice_enabled": VOICE_ENABLED})
+            return
+        self._json({"error": "not found"}, status=404)
+
+    def do_POST(self):
+        if self.path != "/api/voice":
+            self._json({"error": "not found"}, status=404)
+            return
+        if not self._auth_ok():
+            self._json({"error": "unauthorized"}, status=401)
+            return
+        self._handle_voice()
+
+    def _auth_ok(self) -> bool:
+        if not VOICE_TOKEN:
+            return False
+        header = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not header.startswith(prefix):
+            return False
+        return hmac.compare_digest(header[len(prefix):], VOICE_TOKEN)
 
     def log_message(self, format, *args):
         sys.stdout.write(
