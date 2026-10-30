@@ -167,7 +167,7 @@ from hook 28 and rebuild.
 
 ### `Permission denied` opening `/dev/bus/usb/...`
 **Cause:** No udev rule for the EDL device.
-**Fix:** Either run as root, or add the udev rule (see [03-flashing.md](03-flashing.md#step-0-allow-usb-access-to-the-edl-device)).
+**Fix:** Either run as root, or add the udev rule (see [03-flashing.md](03-flashing.md#troubleshooting)).
 
 ### `flash.sh --firmware` complains `rawprogram*.xml: No such file`
 **Cause:** Firmware archive corrupted or wrong version.

@@ -14,6 +14,7 @@ import json
 import ssl
 import re
 import signal
+import socket
 import difflib
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -50,7 +51,7 @@ WAKE_ACTIVATIONS = int(os.getenv("WAKE_ACTIVATIONS", "3"))  # consecutive frames
 WAKE_MIN_RMS = int(os.getenv("WAKE_MIN_RMS", "300"))  # skip model if chunk is quieter than this
 SILENCE_THRESHOLD = int(os.getenv("SILENCE_THRESHOLD", "500"))
 SILENCE_DURATION = float(os.getenv("SILENCE_DURATION", "1.5"))
-MAX_RECORD_SECONDS = 15
+MAX_RECORD_SECONDS = float(os.getenv("MAX_RECORD_SECONDS", "15"))
 
 # MQTT config
 MQTT_BROKER = os.getenv("MQTT_BROKER", "")
@@ -866,7 +867,8 @@ def get_sensor_summary():
 # If this is exceeded Genie returns status=4 ("Context Size was exceeded"),
 # genie_server now traps that and returns a spoken-friendly apology rather
 # than the silent socket close that previously made every long question fail.
-_SYSTEM_PROMPT_BUDGET_CHARS = 2200
+# Boards with a larger context window raise it via LLM_SYSTEM_PROMPT_BUDGET_CHARS.
+_SYSTEM_PROMPT_BUDGET_CHARS = int(os.getenv("LLM_SYSTEM_PROMPT_BUDGET_CHARS", "2200"))
 _last_system_prompt_size = None
 
 # Lean prose prompt — used when the query clearly isn't a device command.
@@ -3606,6 +3608,34 @@ def _kill_arecord():
     _arecord_proc = None
 
 
+# --- LLM yield gate ---
+# On boards where the LLM shares CPU or memory bandwidth with the voice loop
+# (ZimaBoard 2), a root-owned socket service freezes the LLM server while a
+# voice command runs, so a long web-chat generation cannot slow the fast path.
+# Unset (the Q6A default) means every call below is a no-op.
+LLM_GATE_PATH = os.getenv("PEREGRINE_LLM_GATE", "")
+
+
+def llm_gate(verb):
+    """Send "freeze" or "thaw" to the yield-gate socket.
+
+    freeze waits for the gate to confirm, so a thaw sent right after can never
+    overtake it. thaw is fire-and-forget. The gate auto-thaws after 5 s, so a
+    crash here can never leave the LLM frozen.
+    """
+    if not LLM_GATE_PATH:
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(LLM_GATE_PATH)
+            s.sendall(verb.encode() + b"\n")
+            if verb == "freeze":
+                s.recv(16)
+    except OSError as e:
+        print(f"  [gate] {verb} failed: {e}")
+
+
 def play_beep(wav_path=None):
     """Play a pre-generated beep WAV (blocking)."""
     if wav_path is None:
@@ -3847,10 +3877,22 @@ _SENTENCE_END_RE = re.compile(r'[.!?][")\]\'}]*\s+')
 _STREAM_FLUSH_CHARS = 120
 
 
-def _is_leak_or_meta(text):
+def _has_instruction_leak(line, user_prompt=None):
+    """True if ``line`` echoes the system prompt or internal documentation.
+
+    A term the user asked about is not a leak: "What is an ESP32?" has to be
+    answered with "ESP32", and treating that as a documentation echo dropped
+    every answer to it.
+    """
+    asked = (user_prompt or "").lower()
+    return any(m.group(0).lower() not in asked
+               for m in _INSTRUCTION_LEAK_RE.finditer(line))
+
+
+def _is_leak_or_meta(text, user_prompt=None):
     for line in text.split('\n'):
         stripped = line.strip()
-        if _META_START_RE.match(stripped) or _INSTRUCTION_LEAK_RE.search(stripped):
+        if _META_START_RE.match(stripped) or _has_instruction_leak(stripped, user_prompt):
             return True
     return False
 
@@ -3871,7 +3913,7 @@ def _clean_llm_response(text, user_prompt=None):
     cleaned = []
     for line in lines:
         stripped = line.strip()
-        if _META_START_RE.match(stripped) or _INSTRUCTION_LEAK_RE.search(stripped):
+        if _META_START_RE.match(stripped) or _has_instruction_leak(stripped, user_prompt):
             break
         cleaned.append(line)
     result = '\n'.join(cleaned).strip()
@@ -3965,7 +4007,7 @@ def ask_llm_stream(prompt):
                         buffer = buffer[cut + 2:]
                     else:
                         break
-                    if _is_leak_or_meta(sentence):
+                    if _is_leak_or_meta(sentence, prompt):
                         return
                     if (not first_sentence_yielded
                             and _normalize_for_echo_check(sentence) == norm_prompt):
@@ -3977,7 +4019,7 @@ def ask_llm_stream(prompt):
             if obj.get("done"):
                 break
         remainder = buffer.strip()
-        if remainder and not _is_leak_or_meta(remainder):
+        if remainder and not _is_leak_or_meta(remainder, prompt):
             if (not first_sentence_yielded
                     and _normalize_for_echo_check(remainder) == norm_prompt):
                 pass  # drop trailing echo if nothing real was emitted
@@ -4203,6 +4245,7 @@ while True:
     try:
         listen_for_wake_word(ignore_seconds=ignore_after_speak)
         ignore_after_speak = 0  # reset for next iteration
+        llm_gate("freeze")
         time.sleep(0.15)  # brief pause so wake beep doesn't feel instant
         play_beep(BEEP_WAKE_WAV)
         _drain_audio_buffer()  # discard audio that buffered during beep
@@ -4215,12 +4258,16 @@ while True:
         print(f"  You said: \"{user_text}\"")
 
         if not user_text or len(user_text.strip()) < 2:
+            llm_gate("thaw")
             speak("I didn't catch that.")
             ignore_after_speak = 3
             continue
 
         # Try fast intent matching first
         response = match_intent(user_text)
+        # The command has been acted on; generation may resume. The voice
+        # loop's own LLM call below must never wait on a frozen server.
+        llm_gate("thaw")
         if response:
             speak(response)
         else:
@@ -4263,9 +4310,11 @@ while True:
         print()
 
     except KeyboardInterrupt:
+        llm_gate("thaw")
         print("\nShutting down...")
         break
     except Exception as e:
+        llm_gate("thaw")
         print(f"  Loop error: {e}")
         time.sleep(1)
 

@@ -1,0 +1,62 @@
+[Unit]
+Description=TrailCurrent Peregrine Voice Assistant
+After=network.target sound.target peregrine-llm-bridge.service
+Wants=peregrine-llm-bridge.service
+
+[Service]
+Type=simple
+User=trailcurrent
+Group=audio
+# Group=audio replaces the user's primary group, and systemd does not add it
+# back; the yield-gate socket is group trailcurrent.
+SupplementaryGroups=trailcurrent
+WorkingDirectory=/home/trailcurrent
+ExecStartPre=/bin/sleep 5
+ExecStart=/home/trailcurrent/assistant-env/bin/python3 /home/trailcurrent/assistant.py
+Restart=on-failure
+RestartSec=10
+
+# Environment
+Environment=HOME=/home/trailcurrent
+Environment=WAKE_MODEL_PATH=/home/trailcurrent/models/hey_peregrine.onnx
+Environment=PATH=/home/trailcurrent/assistant-env/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+# Hard-disable HuggingFace Hub network calls. The Whisper weights ship in the
+# image's HF cache and never need to be (re)fetched.
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=HF_DATASETS_OFFLINE=1
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+Environment=HF_HUB_DISABLE_IMPLICIT_TOKEN=1
+# ZimaBoard 2: four cores, three of them for the fast path; 8K context per
+# LLM slot fits the full device list; long questions get 30 s to finish.
+Environment=CPU_THREADS=3
+Environment=MAX_RECORD_SECONDS=30
+Environment=LLM_SYSTEM_PROMPT_BUDGET_CHARS=8000
+# Wake-word audio gate OFF. The gate skips quiet 80 ms chunks to save CPU on
+# the Q6A, but the pause between "hey" and "peregrine" falls to room level
+# (~30) and resets the detection at any threshold; skipped chunks also reach
+# the model with the gap cut out. Feeding every chunk costs ~9% of one N150
+# core (measured 2026-10-27).
+Environment=WAKE_MIN_RMS=0
+# Freeze web-chat generation while a voice command runs (yield gate).
+Environment=PEREGRINE_LLM_GATE=/run/peregrine/llm-gate.sock
+# Site-specific config (MQTT, thresholds, etc.) — never overwritten by deploys.
+EnvironmentFile=-/home/trailcurrent/assistant.env
+
+# Placement: cores 0-2, highest CPU weight, last thing the OOM killer takes.
+AllowedCPUs=0-2
+Nice=-5
+CPUWeight=1000
+MemoryHigh=1G
+OOMScoreAdjust=-500
+
+# Hardening
+ProtectSystem=strict
+ReadWritePaths=/home/trailcurrent /tmp
+ProtectHome=tmpfs
+BindPaths=/home/trailcurrent
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

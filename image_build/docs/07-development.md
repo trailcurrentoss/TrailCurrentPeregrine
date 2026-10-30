@@ -10,7 +10,7 @@ covers the lighter-weight dev cycle.
 | Path | When to use | Time per cycle |
 |---|---|---|
 | **Image build + flash** (`build.sh` + `flash.sh`) | New board, OS package changes, model updates, dependency changes | ~50 min build + ~10 min flash |
-| **deploy.sh** | Iterating on `src/assistant.py` or `src/genie_server.py` on a running board | ~5 sec |
+| **deploy.sh** | Iterating on `src/` on a running board | ~5 sec |
 
 `deploy.sh` is a development tool. **It is not part of the production install
 path.** Anything you change with `deploy.sh` will be lost the next time you
@@ -19,18 +19,28 @@ single source of truth.
 
 ## Using `deploy.sh`
 
+`deploy.sh` is for the Radxa Dragon Q6A only. Both boards answer as
+`peregrine.local`, so it checks the board first and refuses anything that is
+not aarch64: pushing the Q6A's units to a ZimaBoard 2 would break it. A
+ZimaBoard takes code changes through a rebuilt image; see
+[zimaboard2/docs/install.md](../../zimaboard2/docs/install.md).
+
 ```bash
 ./deploy.sh peregrine.local
 ```
 
 This SCPs the following files to the board:
-- `src/assistant.py` → `/home/trailcurrent/assistant.py`
-- `src/genie_server.py` → `/home/trailcurrent/genie_server.py`
-- `models/hey_peregrine.onnx` → `/home/trailcurrent/models/hey_peregrine.onnx`
-- `config/voice-assistant.service` → `/etc/systemd/system/voice-assistant.service`
-- `config/genie-server.service` → `/etc/systemd/system/genie-server.service`
+- `src/assistant.py`, `src/tts.py`, `src/stt.py`, `src/genie_server.py`,
+  `src/web_chat.py` → `/home/trailcurrent/`
+- `scripts/generate-certs.sh` → `/usr/local/sbin/peregrine-gen-certs.sh`
+  (and mints the web UI certificate if the board has none)
+- `models/hey_peregrine.onnx` (+ `.data`) → `/home/trailcurrent/models/`
+- `config/voice-assistant.service`, `config/genie-server.service`,
+  `config/peregrine-chat.service` and
+  `image_build/files/systemd/cpu-performance.service` → `/etc/systemd/system/`
 
-Then it runs `systemctl daemon-reload`. After deploy, restart manually:
+It also refreshes `openwakeword` and `timezonefinder` in the venv, then runs
+`systemctl daemon-reload`. After deploy, restart manually:
 
 ```bash
 ssh trailcurrent@peregrine.local sudo systemctl restart voice-assistant

@@ -12,10 +12,14 @@
 # The board must already be flashed with a Peregrine image and reachable
 # via SSH as the trailcurrent user.
 #
+# Radxa Dragon Q6A only. A ZimaBoard 2 runs a different LLM stack and its own
+# unit files, so this script refuses to push to it; update a ZimaBoard by
+# rebuilding and reinstalling its image (zimaboard2/docs/install.md).
+#
 # Usage:
 #   ./deploy.sh peregrine.local
-#   ./deploy.sh 192.168.1.50
-#   ./deploy.sh trailcurrent@192.168.1.50
+#   ./deploy.sh <board-ip>
+#   ./deploy.sh trailcurrent@<board-ip>
 # ============================================================================
 
 set -euo pipefail
@@ -54,6 +58,15 @@ trap cleanup EXIT
 SCP="scp -o ControlPath=$SOCK"
 SSH="ssh -o ControlPath=$SOCK"
 SSHT="ssh -t -o ControlPath=$SOCK"
+
+# ── Board check: both boards answer as peregrine.local ─────────────────────
+REMOTE_ARCH="$($SSH "$TARGET" uname -m)"
+if [ "$REMOTE_ARCH" != "aarch64" ]; then
+    echo "ERROR: ${TARGET} is ${REMOTE_ARCH}, not a Radxa Dragon Q6A (aarch64)."
+    echo "  deploy.sh would replace a ZimaBoard 2's units with the Q6A's."
+    echo "  Update a ZimaBoard by rebuilding its image: see zimaboard2/docs/install.md"
+    exit 1
+fi
 
 # ── 1. Refresh openwakeword (--no-deps; tflite-runtime has no aarch64 wheel) ─
 echo "[1/6] Refreshing openwakeword + timezonefinder..."

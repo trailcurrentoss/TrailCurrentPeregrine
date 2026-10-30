@@ -48,7 +48,7 @@ Default credentials: **`trailcurrent`** / **`trailcurrent`**
   ✓ Password changed
 ```
 
-The wizard then walks through four steps:
+The wizard then walks through three steps:
 
 ## Step 1 — Change password (forced)
 
@@ -60,7 +60,7 @@ password. There is no way to skip this on first run.
 ```
 ── MQTT broker (optional) ──
   Configure MQTT now? [Y/n]: y
-  Broker hostname or IP: 192.168.1.100
+  Broker hostname or IP: headwaters.local
   Port [8883]:
   Use TLS? [Y/n]:
   Username (blank to skip): peregrine
@@ -84,28 +84,40 @@ You can skip this step entirely by answering `n`. The assistant will run
 without MQTT — wake-word + STT + LLM + TTS still all work locally; you just
 don't get cloud telemetry.
 
-## Step 3 — Static IP (optional)
+## Step 3 — Done
 
 ```
-── Network (optional) ──
-  Configure a static IP? [y/N]: y
-  Address with prefix (e.g. 192.168.1.50/24): 192.168.1.50/24
-  Gateway (e.g. 192.168.1.1): 192.168.1.1
-  DNS server [1.1.1.1]:
-  ✓ Static IP configured on Wired connection 1
+── Starting voice assistant ──
+  ✓ Services restarted
+
+============================================
+  TrailCurrent Peregrine — Setup complete
+============================================
+  Quick reference:
+    Logs:      sudo journalctl -u voice-assistant -f
+    Restart:   sudo systemctl restart voice-assistant
+    Edit cfg:  nano ~/assistant.env
+    Self-test: peregrine-self-test
+
+  Say "hey peregrine" to wake the assistant.
 ```
 
-The wizard uses `nmcli` to write the address to the existing wired connection
-profile. If your network has reliable DHCP you can skip this entirely.
+The wizard creates `~/.peregrine-setup-complete` so it never runs again on
+this board automatically. You can re-run it manually any time:
 
-## Step 4 — Hardware self-test (optional)
-
-```
-── Hardware self-test (optional) ──
-  Run hardware self-test now? [Y/n]:
+```bash
+/usr/local/bin/peregrine-first-login.sh
 ```
 
-This runs `peregrine-self-test` which checks:
+## Hardware self-test
+
+The wizard does not run the self-test. Run it once the wizard finishes:
+
+```bash
+peregrine-self-test
+```
+
+It checks:
 
 1. ALSA capture device (Jabra Speak)
 2. ALSA playback device
@@ -140,32 +152,20 @@ A passing run looks like:
 Summary: 8 passed, 0 warnings, 0 failed
 ```
 
-If anything fails, the wizard still completes — but you should investigate
-before relying on the assistant.
+If anything fails, investigate before relying on the assistant; see
+[06-troubleshooting.md](06-troubleshooting.md).
 
-## Step 5 — Done
+## Optional: static IP (not part of the wizard)
 
-```
-── Starting voice assistant ──
-  ✓ Services restarted
-
-============================================
-  TrailCurrent Peregrine — Setup complete
-============================================
-  Quick reference:
-    Logs:      sudo journalctl -u voice-assistant -f
-    Restart:   sudo systemctl restart voice-assistant
-    Edit cfg:  nano ~/assistant.env
-    Self-test: peregrine-self-test
-
-  Say "hey peregrine" to wake the assistant.
-```
-
-The wizard creates `~/.peregrine-setup-complete` so it never runs again on
-this board automatically. You can re-run it manually any time:
+The wizard leaves networking on DHCP. If your network has reliable DHCP, skip
+this. Otherwise set an address on the wired connection with `nmcli`:
 
 ```bash
-/usr/local/bin/peregrine-first-login.sh
+nmcli connection show                         # find the wired profile's name
+sudo nmcli connection modify "Wired connection 1" \
+    ipv4.method manual ipv4.addresses <address>/24 \
+    ipv4.gateway <gateway> ipv4.dns <dns-server>
+sudo nmcli connection up "Wired connection 1"
 ```
 
 ## Trying it out

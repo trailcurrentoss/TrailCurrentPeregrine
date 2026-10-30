@@ -1,0 +1,12 @@
+# TrailCurrent Peregrine (ZimaBoard 2) — DHCP on whichever 2.5 GbE port is
+# plugged in. "optional" keeps boot from waiting on an unplugged port.
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    wired:
+      match:
+        name: "en*"
+      dhcp4: true
+      dhcp6: true
+      optional: true

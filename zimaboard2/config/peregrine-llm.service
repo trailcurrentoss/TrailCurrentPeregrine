@@ -1,0 +1,57 @@
+[Unit]
+Description=Peregrine LLM server (llama.cpp llama-server)
+After=local-fs.target systemd-udevd.service
+
+[Service]
+Type=simple
+User=peregrine-llm
+Group=peregrine-llm
+SupplementaryGroups=render video
+# Written only by peregrine-model. Documents every setting: llm.env.example
+EnvironmentFile=/etc/peregrine/llm.env
+# Mesa keeps compiled Vulkan pipelines here, so only the first boot pays for
+# shader compilation.
+CacheDirectory=peregrine-llm
+Environment=MESA_SHADER_CACHE_DIR=/var/cache/peregrine-llm
+Environment=XDG_CACHE_HOME=/var/cache/peregrine-llm
+ExecStart=/opt/llama.cpp/current/bin/llama-server --model ${LLM_MODEL} \
+    --host 127.0.0.1 --port 8080 \
+    -dev ${LLM_DEVICE} -ngl ${LLM_NGL} -t ${LLM_THREADS} -tb ${LLM_THREADS} \
+    -c ${LLM_CTX_TOTAL} -np ${LLM_SLOTS} \
+    -fa on -ctk q8_0 -ctv q8_0 --jinja --cache-reuse 256 --load-mode none \
+    $LLM_EXTRA_ARGS
+# Weights resident and shaders compiled before voice-assistant comes up.
+ExecStartPost=/usr/local/libexec/peregrine-llm-warmup
+TimeoutStartSec=900
+Restart=on-failure
+RestartSec=10
+
+# Placement: cores 1-3. Core 0 is the voice loop's alone; on 1-2 the voice
+# loop outranks this unit 50:1 (CPUWeight) and the yield gate freezes it
+# during a voice command. The iGPU lane uses one host thread here.
+AllowedCPUs=1-3
+Nice=10
+CPUWeight=20
+IOWeight=10
+MemoryMax=4.5G
+OOMScoreAdjust=500
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=true
+ReadOnlyPaths=/var/lib/peregrine/llm
+DevicePolicy=closed
+DeviceAllow=char-drm rw
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

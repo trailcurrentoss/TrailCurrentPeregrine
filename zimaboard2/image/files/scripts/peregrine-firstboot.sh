@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# ============================================================================
+# TrailCurrent Peregrine — First-boot setup
+# Runs once on the first boot after flashing the golden image, before any
+# user-facing services. Regenerates per-board identity, expands rootfs to
+# fill the boot disk (eMMC or SATA), then disables itself.
+# ============================================================================
+
+set -uo pipefail
+
+log() { echo "[firstboot] $*"; }
+
+mkdir -p /var/lib/peregrine
+
+# 1. Regenerate machine-id (was cleared in the golden image)
+if [[ ! -s /etc/machine-id ]]; then
+    systemd-machine-id-setup
+    log "Regenerated /etc/machine-id"
+fi
+
+# 2. Regenerate SSH host keys if missing (the installer mints per-board keys)
+if ! ls /etc/ssh/ssh_host_*_key &>/dev/null; then
+    dpkg-reconfigure -f noninteractive openssh-server
+    log "Regenerated SSH host keys"
+fi
+
+# 3. Expand the root partition to fill the boot disk (mmcblk0 or sdX —
+#    taken from the mounted root, never hard-coded). The installer already
+#    sizes it to the disk, so this is normally a no-op.
+ROOT_DEV=$(findmnt -n -o SOURCE /)
+ROOT_DISK=$(lsblk -ndo PKNAME "$ROOT_DEV" 2>/dev/null || echo "")
+
+if [[ -n "$ROOT_DISK" ]]; then
+    PART_NUM=$(echo "$ROOT_DEV" | grep -oP '\d+$')
+    if [[ -n "$PART_NUM" ]]; then
+        log "Expanding /dev/${ROOT_DISK} partition ${PART_NUM} to fill disk..."
+        growpart "/dev/${ROOT_DISK}" "${PART_NUM}" 2>/dev/null || \
+            log "growpart reported no change (already at max)"
+        resize2fs "$ROOT_DEV" 2>/dev/null || \
+            log "resize2fs reported no change"
+        log "Root filesystem expanded"
+    else
+        log "WARNING: Could not parse partition number from $ROOT_DEV"
+    fi
+else
+    log "WARNING: Could not determine root disk for expansion"
+fi
+
+# 4. Mint a per-board TLS certificate for the web chat UI.
+#    Each board gets its own CA + server cert. Devices that have trusted one
+#    Peregrine only trust that specific board, not the whole product line.
+if [[ -x /usr/local/sbin/peregrine-gen-certs.sh ]]; then
+    log "Minting self-signed TLS certificate for the web UI..."
+    if PEREGRINE_HOSTNAME="peregrine.local" \
+       /usr/local/sbin/peregrine-gen-certs.sh; then
+        log "TLS certificate ready."
+    else
+        log "WARNING: TLS cert generation failed — web UI will fall back to HTTP."
+    fi
+else
+    log "WARNING: peregrine-gen-certs.sh not installed — skipping TLS cert mint."
+fi
+
+# 5. Mark complete and disable this service
+touch /var/lib/peregrine/.firstboot-done
+systemctl disable peregrine-firstboot.service 2>/dev/null || true
+log "First-boot complete — service disabled. No reboot needed."

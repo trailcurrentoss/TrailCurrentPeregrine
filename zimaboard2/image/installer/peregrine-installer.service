@@ -1,0 +1,20 @@
+[Unit]
+Description=TrailCurrent Peregrine installer (tty1)
+After=systemd-user-sessions.service plymouth-quit-wait.service casper.service
+Conflicts=getty@tty1.service
+Before=getty@tty1.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/peregrine-install
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

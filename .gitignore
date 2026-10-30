@@ -105,6 +105,9 @@ training/**/*.pth
 # Image build artifacts (large — built from source)
 image_build/cache/
 image_build/output/
+zimaboard2/image/cache/
+zimaboard2/image/output/
+zimaboard2/image/netinstall.env
 
 # rsdk build outputs and externally-cloned keyrings (vendored source only)
 image_build/rsdk/out/

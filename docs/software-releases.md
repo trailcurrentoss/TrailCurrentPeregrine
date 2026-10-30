@@ -3,6 +3,13 @@
 How to package a change to `src/`, models, or service files and push it to
 fielded Peregrine boards **without** reflashing the image.
 
+> **Radxa Dragon Q6A only.** This track uses `deploy.sh`, which refuses to
+> run against a ZimaBoard 2. ZimaBoard 2 boards take the same `src/` and
+> wake-word changes in their next installer ISO
+> (`./zimaboard2/image/build.sh --version X.Y`, then reinstall; see
+> [zimaboard2/docs/install.md](../zimaboard2/docs/install.md)). Because
+> `src/` is shared, check a `src/` change on both boards before releasing it.
+
 This is a parallel release track to the image release process in
 [image_build/docs/08-cutting-a-release.md](../image_build/docs/08-cutting-a-release.md).
 The two tracks differ in scope:
@@ -72,6 +79,8 @@ below) is the source of truth for "what landed on which board."
 - [ ] Changes are scoped to the software-release set above
 - [ ] Tested on a dev board via `deploy.sh` for at least one full
        conversation cycle (wake → STT → LLM → TTS)
+- [ ] If `src/` changed, also checked on a ZimaBoard 2 (rebuilt ISO, or the
+       QEMU test in `zimaboard2/image/test-vm.sh`)
 - [ ] If the wake-word model changed, false-positive rate sanity-checked
        (board sits idle for a few minutes without spurious wakes)
 - [ ] If MQTT command surface changed, verified against a real broker

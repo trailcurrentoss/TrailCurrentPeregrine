@@ -1,0 +1,36 @@
+[Unit]
+Description=Peregrine LLM bridge (Genie-compatible API on :11434 -> llama-server)
+After=peregrine-llm.service
+Requires=peregrine-llm.service
+
+[Service]
+Type=simple
+User=peregrine-llm
+Group=peregrine-llm
+EnvironmentFile=/etc/peregrine/llm.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/peregrine/llm_bridge.py
+Restart=on-failure
+RestartSec=3
+
+AllowedCPUs=3
+Nice=10
+MemoryMax=128M
+
+# Stdlib-only Python service — safe to harden fully.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

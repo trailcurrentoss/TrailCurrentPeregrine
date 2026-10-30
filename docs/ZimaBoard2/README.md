@@ -1,11 +1,24 @@
 # Peregrine on ZimaBoard 2 — Port Plan (rev 2.1)
 
-**Status:** Plan only. Nothing here is implemented. The maintainer has answered
-the blocking questions (§9); implementation starts on approval of this revision.
+**Status:** Supported. The ZimaBoard 2 is Peregrine's premium board,
+alongside the Radxa Dragon Q6A as the budget board (see the
+[main README](../../README.md#choose-your-board)). The bridge, units, model
+tool, yield gate, USB installer and network installer are in
+[`zimaboard2/`](../../zimaboard2/); install with
+[zimaboard2/docs/install.md](../../zimaboard2/docs/install.md). The LLM
+throughput and memory measurements are in
+[zimaboard2/docs/benchmarks.md](../../zimaboard2/docs/benchmarks.md). The
+other §5 measurements (step 0 baseline, power, fast path under load, soak)
+have not been run yet, so every figure below that says *measure* is still
+open. Not yet implemented: `LLM_PROMPT_LAYOUT`, `PEREGRINE_TIMING`,
+`zimaboard2/deploy.sh` and the bench/load tools. This document is the design;
+where it and the code disagree (the iGPU lane, the default model), the code
+and benchmarks.md are current.
 
 **Goal:** Run Peregrine on a
-[ZimaBoard 2](https://shop.zimaspace.com/products/zimaboard2-single-board-server)
-(Intel N150, 8 GB LPDDR5, Intel UHD iGPU, 2× USB 3.1, eMMC, Ubuntu Server
+[ZimaBoard 2](https://shop.zimaspace.com/products/zimaboard2-single-board-server?sca_ref=12564611.fDJvFR9EWxuoB4a&utm_source=dave-floyd&utm_medium=affiliate&utm_campaign=zimaspace_affiliate&utm_content=Dave-Floyd&sca_source=GitHub)
+(affiliate link: TrailCurrent earns a small percentage, it costs you nothing
+extra) (Intel N150, 8 GB LPDDR5, Intel UHD iGPU, 2× USB 3.1, eMMC, Ubuntu Server
 24.04, no PCIe card). The requirements are:
 
 1. **No fast-path regression.** The chain wake word → endpoint → STT → intent →
@@ -33,9 +46,11 @@ the blocking questions (§9); implementation starts on approval of this revision
 only while the Q6A-visible footprint stays at **`deploy.sh` plus one or two
 other files**. If implementation ever needs more than that, stop and switch
 to a separate fork (rev 1 layout) instead. With the bridge (§2.3), the
-footprint is **one file: `src/assistant.py`**. `deploy.sh` does not change,
-because no new shared file is added. Nothing under `config/` or
-`image_build/` changes either.
+footprint is **`src/assistant.py`** plus a board check in **`deploy.sh`**:
+both boards answer as `peregrine.local`, so `deploy.sh` now refuses a
+non-aarch64 board rather than overwrite a ZimaBoard's units with the Q6A's.
+No new shared file is added, and nothing under `config/` or `image_build/`
+changes.
 
 What rev 2 keeps from rev 1:
 
@@ -156,8 +171,8 @@ R3 (the LLM) changes to `llama-server` (§2.3).
 - **Users and hardening.** The services run as `trailcurrent`, an interactive
   sudo user whose password is changed by the first-login wizard. Root is
   locked, there is no desktop, and Wi-Fi is blacklisted.
-  - There is **no locked `assistant` service user** today. The task brief and
-    the project `CLAUDE.md` both say there is; both are out of date.
+  - There is **no locked `assistant` service user** today. Older project
+    notes say there is; they are out of date.
   - The ZimaBoard keeps the same model for parity, and adds a locked system
     user only for `llama-server` (§2.4).
 - **ALSA.** `image_build/files/alsa/asound.conf` pins `card 0`. That holds on
@@ -408,12 +423,14 @@ there is no measured reason to change it.
 
 ### 3.2 Q6A layer: unchanged
 
-`deploy.sh`, `config/` and `image_build/` are **not modified**. `deploy.sh`
-already copies `assistant.py`, and no new shared file is added.
+`config/` and `image_build/` are **not modified**. `deploy.sh` already copies
+`assistant.py`; its only change is the board check that refuses a
+non-aarch64 target. No new shared file is added.
 
-Total Q6A-visible footprint: **`src/assistant.py`, one file.** That is inside
-the sharing rule (deploy.sh + one or two files), with one file of slack
-reserved for the possible `web_chat.py` gate call. Because `assistant.py`
+Total Q6A-visible footprint: **`deploy.sh` (board check) and
+`src/assistant.py`.** That is inside the sharing rule (deploy.sh + one or two
+files), with one file of slack reserved for the possible `web_chat.py` gate
+call. Because `assistant.py`
 changes, the Q6A gets the §5.6 smoke test when it does.
 
 The missing `stt.py` install in the Q6A image (§1.5) is a separate Q6A fix.
@@ -467,9 +484,9 @@ zimaboard2/
 
 | Action | Q6A | ZimaBoard 2 |
 |---|---|---|
-| Build an image | `sudo ./image_build/build.sh` | `sudo ./zimaboard2/image/build.sh` |
-| Dev push | `./deploy.sh <host>` | `./zimaboard2/deploy.sh <host>` (or `PEREGRINE_DEVICE`) |
-| Image artefact | `peregrine-q6a-vX.Y.img` | `peregrine-zimaboard2-vX.Y.img.zst` |
+| Build an image | `sudo ./image_build/build.sh` | `./zimaboard2/image/build.sh --version X.Y` (normal user, Docker) |
+| Dev push | `./deploy.sh <host>` | Not implemented: rebuild and reinstall. `deploy.sh` refuses a non-aarch64 board |
+| Image artefact | `peregrine-q6a-vX.Y.img` | `peregrine-zimaboard2-X.Y.iso` + a network-install bundle |
 
 - The entry point *is* the target selector. Both builds stage the same `src/`.
 - At runtime, target behaviour comes **only from the env in that target's unit
@@ -700,8 +717,9 @@ Each step is small, runs on the board, and has a check that closes it.
 - **The `trailcurrent` user model, `assistant.env`, MQTT/TLS, the Headwaters
   API key, the per-board web CA and the voice-terminal token.** All
   identical.
-- **The Q6A `deploy.sh`, `config/`, `image_build/` and release docs.** None
-  of them change.
+- **The Q6A `config/` and `image_build/`.** Neither changes. `deploy.sh`
+  gains only the board check, and the release docs only note which board
+  each track covers.
 - **Hostname `peregrine`.** It names the AI role in a TrailCurrent install,
   not the hardware. Both targets use it, and only one Peregrine runs per
   install.

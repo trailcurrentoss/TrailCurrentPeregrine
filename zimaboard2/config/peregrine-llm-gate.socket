@@ -1,0 +1,13 @@
+[Unit]
+Description=Peregrine LLM yield gate (voice-assistant pauses web-chat generation)
+
+[Socket]
+ListenStream=/run/peregrine/llm-gate.sock
+SocketUser=root
+SocketGroup=trailcurrent
+SocketMode=0660
+DirectoryMode=0755
+Accept=yes
+
+[Install]
+WantedBy=sockets.target

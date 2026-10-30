@@ -1,0 +1,11 @@
+[Unit]
+Description=Peregrine LLM yield gate request
+CollectMode=inactive-or-failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/peregrine-llm-gate
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+TimeoutStartSec=5

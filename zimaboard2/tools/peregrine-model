@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# ============================================================================
+# TrailCurrent Peregrine (ZimaBoard 2) — LLM model manager
+#
+#   peregrine-model list              Files, sizes, licences, active model
+#   peregrine-model set <name>        Switch model; smoke-test; roll back on failure
+#   peregrine-model import <file>     Offline copy (USB/SCP) with SHA-256 check
+#   peregrine-model bench <name>      llama-bench on the iGPU (plan §5.1 config)
+#   peregrine-model rm <name>         Delete a model (refuses the active one)
+#
+# <name> is a GGUF basename with or without .gguf. A model may have a
+# <name>.args sidecar holding extra llama-server flags (LLM_EXTRA_ARGS) and a
+# <name>.license file holding its licence name. There is no download command:
+# Peregrine never touches the network at runtime.
+# ============================================================================
+
+set -euo pipefail
+
+MODELS=/var/lib/peregrine/llm/models
+ENV_FILE=/etc/peregrine/llm.env
+LLAMA=/opt/llama.cpp/current/bin
+
+die() { echo "peregrine-model: $*" >&2; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die "run with sudo"; }
+
+resolve() {
+    local n="${1%.gguf}"
+    [[ "$n" == */* ]] && die "give a model name, not a path (see: peregrine-model list)"
+    [[ -f "$MODELS/$n.gguf" ]] || die "no model '$n' in $MODELS"
+    echo "$n"
+}
+
+active() {
+    local m
+    m=$(sed -n 's/^LLM_MODEL=//p' "$ENV_FILE" 2>/dev/null | tail -1)
+    basename "${m%.gguf}"
+}
+
+set_env() {   # set_env KEY VALUE  — rewrite one line of llm.env in place
+    local key="$1" val="$2"
+    if grep -q "^$key=" "$ENV_FILE"; then
+        sed -i "s|^$key=.*|$key=$val|" "$ENV_FILE"
+    else
+        echo "$key=$val" >> "$ENV_FILE"
+    fi
+}
+
+smoke() {
+    local i
+    for i in $(seq 1 60); do
+        systemctl is-active --quiet peregrine-llm && break
+        sleep 5
+    done
+    curl -sf -m 120 http://127.0.0.1:8080/v1/chat/completions \
+        -H 'Content-Type: application/json' \
+        -d '{"messages":[{"role":"user","content":"Reply with the word ready."}],"max_tokens":8}' \
+        | grep -q '"content"'
+}
+
+cmd_list() {
+    local cur f n size lic
+    cur=$(active)
+    printf '  %-45s %8s  %-12s %s\n' NAME SIZE LICENCE ""
+    for f in "$MODELS"/*.gguf; do
+        [[ -e "$f" ]] || { echo "  (no models in $MODELS)"; return; }
+        n=$(basename "${f%.gguf}")
+        size=$(du -h "$f" | cut -f1)
+        lic=$(cat "$MODELS/$n.license" 2>/dev/null || echo "?")
+        printf '  %-45s %8s  %-12s %s\n' "$n" "$size" "$lic" "$([[ $n == "$cur" ]] && echo '<- active')"
+    done
+}
+
+cmd_set() {
+    need_root
+    local n prev_env
+    n=$(resolve "$1")
+    prev_env=$(mktemp)
+    cp -p "$ENV_FILE" "$prev_env"
+    set_env LLM_MODEL "$MODELS/$n.gguf"
+    if [[ -f "$MODELS/$n.args" ]]; then
+        set_env LLM_EXTRA_ARGS "'$(tr -d '\n' < "$MODELS/$n.args")'"
+    else
+        set_env LLM_EXTRA_ARGS ""
+    fi
+    echo "Restarting peregrine-llm with $n (first start compiles shaders — can take minutes)..."
+    systemctl restart peregrine-llm peregrine-llm-bridge || true
+    if smoke; then
+        rm -f "$prev_env"
+        echo "OK — $n is active."
+    else
+        echo "Smoke test FAILED — rolling back to the previous model." >&2
+        cp -p "$prev_env" "$ENV_FILE"
+        rm -f "$prev_env"
+        systemctl restart peregrine-llm peregrine-llm-bridge || true
+        die "kept the previous model; see: journalctl -u peregrine-llm"
+    fi
+}
+
+cmd_import() {
+    need_root
+    local src="$1" n expected got
+    [[ -f "$src" && "$src" == *.gguf ]] || die "need a .gguf file"
+    n=$(basename "${src%.gguf}")
+    [[ -e "$MODELS/$n.gguf" ]] && die "'$n' already exists"
+    read -rp "Expected SHA-256 (blank to print and skip the check): " expected
+    echo "Hashing $src ..."
+    got=$(sha256sum "$src" | cut -d' ' -f1)
+    if [[ -n "$expected" && "${expected,,}" != "$got" ]]; then
+        die "SHA-256 mismatch: got $got"
+    fi
+    echo "  sha256 $got"
+    install -m 644 "$src" "$MODELS/$n.gguf.part"
+    mv "$MODELS/$n.gguf.part" "$MODELS/$n.gguf"
+    for side in args license; do
+        [[ -f "${src%.gguf}.$side" ]] && install -m 644 "${src%.gguf}.$side" "$MODELS/$n.$side"
+    done
+    echo "Imported $n. Activate with: sudo peregrine-model set $n"
+}
+
+cmd_bench() {
+    need_root
+    local n
+    n=$(resolve "$1")
+    echo "Stopping peregrine-llm for the benchmark..."
+    systemctl stop peregrine-llm-bridge peregrine-llm
+    trap 'systemctl start peregrine-llm peregrine-llm-bridge' EXIT
+    # Same backend as the service (llm.env): CPU lane or iGPU lane.
+    local dev ngl thr
+    dev=$(sed -n 's/^LLM_DEVICE=//p' "$ENV_FILE"); ngl=$(sed -n 's/^LLM_NGL=//p' "$ENV_FILE")
+    thr=$(sed -n 's/^LLM_THREADS=//p' "$ENV_FILE")
+    "$LLAMA/llama-bench" -m "$MODELS/$n.gguf" -dev "${dev:-none}" -ngl "${ngl:-0}" -t "${thr:-3}" \
+        -fa 1 -ctk q8_0 -ctv q8_0 -p 512,2048 -n 128 -d 0,4096 -r 3 -o md
+}
+
+cmd_rm() {
+    need_root
+    local n
+    n=$(resolve "$1")
+    [[ "$n" == "$(active)" ]] && die "'$n' is the active model; switch first"
+    rm -f "$MODELS/$n.gguf" "$MODELS/$n.args" "$MODELS/$n.license"
+    echo "Removed $n."
+}
+
+case "${1:-}" in
+    list|"")  cmd_list ;;
+    set)      [[ $# -eq 2 ]] || die "usage: peregrine-model set <name>"; cmd_set "$2" ;;
+    import)   [[ $# -eq 2 ]] || die "usage: peregrine-model import <file.gguf>"; cmd_import "$2" ;;
+    bench)    [[ $# -eq 2 ]] || die "usage: peregrine-model bench <name>"; cmd_bench "$2" ;;
+    rm)       [[ $# -eq 2 ]] || die "usage: peregrine-model rm <name>"; cmd_rm "$2" ;;
+    -h|--help|help) sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)        die "unknown command '$1' (try: peregrine-model help)" ;;
+esac

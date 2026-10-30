@@ -1,0 +1,12 @@
+[Unit]
+Description=Peregrine power policy (CPU EPP, USB autosuspend, SATA ALPM, iGPU cap)
+After=multi-user.target plymouth-quit.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/peregrine/power.env
+ExecStart=/usr/local/sbin/peregrine-power
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

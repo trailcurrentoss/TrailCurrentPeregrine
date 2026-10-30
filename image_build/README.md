@@ -1,7 +1,13 @@
-# TrailCurrent Peregrine — Image Build
+# TrailCurrent Peregrine — Image Build (Radxa Dragon Q6A)
 
 Build a flashable Radxa Dragon Q6A image with the Peregrine voice assistant
 fully baked in. Flash, boot, log in once — done.
+
+> **This is the Radxa Dragon Q6A build: Peregrine's budget board**, with the
+> lowest cost and the lowest power draw, the right choice for a really small
+> battery bank. Building for the premium **ZimaBoard 2** (a 3B model instead
+> of 1B) instead? Follow [zimaboard2/docs/install.md](../zimaboard2/docs/install.md).
+> The [main README](../README.md#choose-your-board) compares the two boards.
 
 ```
                 /\
@@ -20,6 +26,10 @@ fully baked in. Flash, boot, log in once — done.
 ## TL;DR
 
 ```bash
+# 0. Get the code
+git clone https://github.com/trailcurrentoss/TrailCurrentPeregrine.git
+cd TrailCurrentPeregrine
+
 # 1. One-time build host setup
 sudo apt install -y jsonnet bdebstrap libguestfs-tools \
     qemu-user-static binfmt-support device-tree-compiler \

@@ -22,7 +22,9 @@ POST /api/voice   (audio/wav upload, ~16 kHz mono S16LE)
   │       │
   │       └── no match ──▶ /api/enrich (add "you are in <city>" if relevant)
   │                             │
-  │                             └──▶ genie-server /api/chat (Llama 3.2 1B on NPU)
+  │                             └──▶ LLM server /api/chat on 127.0.0.1:11434
+  │                                  (Q6A: genie-server, Llama 3.2 1B on the NPU;
+  │                                   ZimaBoard 2: llm_bridge, Llama 3.2 3B on CPU)
   │                                       │
   │                                       └── if JSON emitted, run through
   │                                           /api/command (device control),
@@ -149,7 +151,7 @@ Set in `peregrine-chat.service` (see [`config/peregrine-chat.service`](../config
 | `PEREGRINE_VOICE_TARGET_SR` | `16000` | Output sample rate. Match the client codec. |
 | `PIPER_MODEL` | `~/piper-voices/en_US-libritts_r-medium.onnx` | Voice for the reply. |
 | `WHISPER_SIZE` | `base.en` | Model size. Match what's installed for `assistant.py`. |
-| `CPU_THREADS` | `8` | Q6A has 8 cores — use them all for STT. |
+| `CPU_THREADS` | `8` | Q6A has 8 cores — use them all for STT. The ZimaBoard 2's unit sets `3`. |
 
 The service uses the **assistant venv Python**
 (`/home/trailcurrent/assistant-env/bin/python3`) because faster-whisper and
